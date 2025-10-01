@@ -1,7 +1,7 @@
 use near_contract_standards::fungible_token::{
     events::{FtBurn, FtMint},
     metadata::{FungibleTokenMetadata, FungibleTokenMetadataProvider, FT_METADATA_SPEC},
-    FungibleToken, FungibleTokenCore, FungibleTokenResolver
+    FungibleToken, FungibleTokenCore, FungibleTokenResolver,
 };
 use near_contract_standards::storage_management::{
     StorageBalance, StorageBalanceBounds, StorageManagement,
@@ -14,7 +14,7 @@ use near_sdk::{
     assert_one_yocto,
     borsh::{BorshDeserialize, BorshSerialize},
     env, ext_contract, is_promise_success,
-    json_types::{U128, U64},
+    json_types::U128,
     log, near, require,
     serde::{Deserialize, Serialize},
     store::{IterableMap, LazyOption},
@@ -29,10 +29,10 @@ mod epoch_actions;
 mod errors;
 mod event;
 mod ft;
-mod storage;
 mod internal;
 mod owner;
 mod stake_pool_itf;
+mod storage;
 #[cfg(test)]
 mod unit;
 mod upgrade;
@@ -53,14 +53,6 @@ pub use view::*;
 
 pub type ShareBalance = u128;
 
-#[near(serializers = [json])]
-pub struct StorageUsageInfo {
-    pub per_account_storage_usage: U64,
-    pub per_account_storage_cost: U128,
-    pub per_conversion_storage_usage: U64,
-    pub per_conversion_storage_cost: U128,
-}
-
 #[derive(BorshSerialize, BorshStorageKey)]
 #[borsh(crate = "near_sdk::borsh")]
 enum StorageKey {
@@ -75,7 +67,7 @@ enum StorageKey {
 pub struct ContractData {
     pub token: FungibleToken,
     pub metadata: LazyOption<FungibleTokenMetadata>,
-    owner_id: AccountId,
+    owner_id: AccountId, // obsolete, keep it for storage stability
     total_staked_near_amount: u128,
     accounts: IterableMap<AccountId, Account>,
     account_storage_usage: StorageUsage,
@@ -309,12 +301,5 @@ impl Contract {
             memo,
         }
         .emit();
-    }
-
-    pub fn per_account_storage_cost(&self) -> u128 {
-        env::storage_byte_cost()
-            .checked_mul(self.data().account_storage_usage as u128)
-            .unwrap()
-            .as_yoctonear()
     }
 }

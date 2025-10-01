@@ -36,15 +36,12 @@ impl Contract {
 
     /// Returns account ID of the staking pool owner.
     pub fn get_owner_id(&self) -> AccountId {
-        self.data().owner_id.clone()
+        env::current_account_id()
     }
 
     pub fn get_reward_fee_fraction(&self) -> RewardFeeFraction {
         RewardFeeFraction {
-            numerator: self.data()
-                .beneficiaries
-                .values()
-                .sum(),
+            numerator: self.data().beneficiaries.values().sum(),
             denominator: 10000,
         }
     }
@@ -111,7 +108,7 @@ impl Contract {
         } else {
             0
         };
-        self.internal_deposit(amount-storage_used);
+        self.internal_deposit(amount - storage_used);
     }
 
     /// Deposits the attached amount into the inner account of the predecessor and stakes it.

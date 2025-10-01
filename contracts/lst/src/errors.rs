@@ -1,13 +1,15 @@
 // initialization
 pub const ERR_ALREADY_INITIALIZED: &str = "Already initialized";
-pub const ERR_NO_ENOUGH_INIT_DEPOSIT: &str = "The account doesn't have enough balance for initialization";
+pub const ERR_NO_ENOUGH_INIT_DEPOSIT: &str =
+    "The account doesn't have enough balance for initialization";
 
 // owner
 pub const ERR_NOT_OWNER: &str = "Only owner can perform this action";
 
 // account
 pub const ERR_FORCE_UNGREGISTER: &str = "Force unregister is not allowed";
-pub const ERR_UNREGISTER_POSITIVE_UNSTAKED: &str = "Can't unregister the account with the positive unstaked balance";
+pub const ERR_UNREGISTER_POSITIVE_UNSTAKED: &str =
+    "Can't unregister the account with the positive unstaked balance";
 
 // fraction
 pub const ERR_BPS_SUM_ONE: &str = "bps sum should be less than 1";

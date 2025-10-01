@@ -30,7 +30,12 @@ impl MockValidatorContract {
 
 /// test stub
 impl MockValidatorContract {
-    pub async fn set_balance_delta(&self, caller: &Account, staked_delta: u128, unstaked_delta: u128) -> Result<ExecutionFinalResult> {
+    pub async fn set_balance_delta(
+        &self,
+        caller: &Account,
+        staked_delta: u128,
+        unstaked_delta: u128,
+    ) -> Result<ExecutionFinalResult> {
         caller
             .call(self.0.id(), "set_balance_delta")
             .args_json(json!({
@@ -53,7 +58,11 @@ impl MockValidatorContract {
             .await
     }
 
-    pub async fn set_get_account_fail(&self, caller: &Account, value: bool) -> Result<ExecutionFinalResult> {
+    pub async fn set_get_account_fail(
+        &self,
+        caller: &Account,
+        value: bool,
+    ) -> Result<ExecutionFinalResult> {
         caller
             .call(self.0.id(), "set_get_account_fail")
             .args_json(json!({

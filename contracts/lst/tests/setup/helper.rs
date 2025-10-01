@@ -7,11 +7,7 @@ impl Context {
     pub async fn op_epoch_stake_all(&self) {
         let mut repeat = true;
         while repeat {
-            let outcome = self
-                .lst_contract
-                .epoch_stake(&self.root)
-                .await
-                .unwrap();
+            let outcome = self.lst_contract.epoch_stake(&self.root).await.unwrap();
             assert!(outcome.is_success() && outcome.receipt_failures().is_empty());
             // println!("logs: {:#?}", outcome.logs());
             repeat = outcome.json::<bool>().unwrap();
@@ -21,11 +17,7 @@ impl Context {
     pub async fn op_epoch_unstake_all(&self) {
         let mut repeat = true;
         while repeat {
-            let outcome = self
-                .lst_contract
-                .epoch_unstake(&self.root)
-                .await
-                .unwrap();
+            let outcome = self.lst_contract.epoch_unstake(&self.root).await.unwrap();
             assert!(outcome.is_success() && outcome.receipt_failures().is_empty());
             // println!("logs: {:#?}", outcome.logs());
             repeat = outcome.json::<bool>().unwrap();
@@ -72,11 +64,10 @@ impl Context {
         }
     }
 
-    pub async fn epoch_height_fast_forward(
-        &self,
-        num_epochs: Option<u64>,
-    ) {
+    pub async fn epoch_height_fast_forward(&self, num_epochs: Option<u64>) {
         let cur = self.lst_contract.read_epoch_height().await.unwrap();
-        check!(self.lst_contract.set_epoch_height(&self.root, cur + num_epochs.unwrap_or(NUM_EPOCHS_TO_UNLOCK)));
+        check!(self
+            .lst_contract
+            .set_epoch_height(&self.root, cur + num_epochs.unwrap_or(NUM_EPOCHS_TO_UNLOCK)));
     }
 }

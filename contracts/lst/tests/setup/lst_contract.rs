@@ -24,7 +24,7 @@ impl LstContract {
             .json::<U128>()
     }
 
-    pub async fn get_account_details(&self, account_id: &AccountId) ->Result<AccountDetailsView> {
+    pub async fn get_account_details(&self, account_id: &AccountId) -> Result<AccountDetailsView> {
         self.0
             .call("get_account_details")
             .args_json(json!({
@@ -132,22 +132,22 @@ impl LstContract {
     ) -> Result<ExecutionFinalResult> {
         if account_id.is_some() {
             caller
-            .call(self.0.id(), "storage_deposit")
-            .args_json(json!({
-                "account_id": account_id
-            }))
-            .deposit(NearToken::from_yoctonear(deposit_amount))
-            .max_gas()
-            .transact()
-            .await
+                .call(self.0.id(), "storage_deposit")
+                .args_json(json!({
+                    "account_id": account_id
+                }))
+                .deposit(NearToken::from_yoctonear(deposit_amount))
+                .max_gas()
+                .transact()
+                .await
         } else {
             caller
-            .call(self.0.id(), "storage_deposit")
-            .args_json(json!({}))
-            .deposit(NearToken::from_yoctonear(deposit_amount))
-            .max_gas()
-            .transact()
-            .await
+                .call(self.0.id(), "storage_deposit")
+                .args_json(json!({}))
+                .deposit(NearToken::from_yoctonear(deposit_amount))
+                .max_gas()
+                .transact()
+                .await
         }
     }
 
@@ -158,22 +158,22 @@ impl LstContract {
     ) -> Result<ExecutionFinalResult> {
         if force.is_some() {
             caller
-            .call(self.0.id(), "storage_unregister")
-            .args_json(json!({
-                "force": force.unwrap()
-            }))
-            .deposit(NearToken::from_yoctonear(1))
-            .max_gas()
-            .transact()
-            .await
+                .call(self.0.id(), "storage_unregister")
+                .args_json(json!({
+                    "force": force.unwrap()
+                }))
+                .deposit(NearToken::from_yoctonear(1))
+                .max_gas()
+                .transact()
+                .await
         } else {
             caller
-            .call(self.0.id(), "storage_unregister")
-            .args_json(json!({}))
-            .deposit(NearToken::from_yoctonear(1))
-            .max_gas()
-            .transact()
-            .await
+                .call(self.0.id(), "storage_unregister")
+                .args_json(json!({}))
+                .deposit(NearToken::from_yoctonear(1))
+                .max_gas()
+                .transact()
+                .await
         }
     }
 }
@@ -618,7 +618,11 @@ impl LstContract {
             .await
     }
 
-    pub async fn epoch_update_rewards(&self, caller: &Account, validator_id: &AccountId) -> Result<ExecutionFinalResult> {
+    pub async fn epoch_update_rewards(
+        &self,
+        caller: &Account,
+        validator_id: &AccountId,
+    ) -> Result<ExecutionFinalResult> {
         caller
             .call(self.0.id(), "epoch_update_rewards")
             .args_json(json!({
@@ -629,7 +633,11 @@ impl LstContract {
             .await
     }
 
-    pub async fn epoch_withdraw(&self, caller: &Account, validator_id: &AccountId) -> Result<ExecutionFinalResult> {
+    pub async fn epoch_withdraw(
+        &self,
+        caller: &Account,
+        validator_id: &AccountId,
+    ) -> Result<ExecutionFinalResult> {
         caller
             .call(self.0.id(), "epoch_withdraw")
             .args_json(json!({

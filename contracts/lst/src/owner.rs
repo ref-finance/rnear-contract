@@ -2,23 +2,10 @@ use crate::*;
 
 #[near]
 impl Contract {
-    #[payable]
-    pub fn set_owner(&mut self, new_owner_id: AccountId) {
-        self.assert_owner();
-        assert_one_yocto();
-        let old_owner_id = self.data().owner_id.clone();
-        self.data_mut().owner_id = new_owner_id;
-        Event::ChangeOwner {
-            old_owner_id: &old_owner_id,
-            new_owner_id: &self.data().owner_id,
-        }
-        .emit();
-    }
-
     #[pause]
+    #[access_control_any(roles(Role::DAO))]
     #[payable]
     pub fn set_beneficiary(&mut self, account_id: AccountId, bps: u32) {
-        self.assert_owner();
         assert_one_yocto();
 
         if self.data().beneficiaries.len() == MAX_BENEFICIARIES
@@ -45,9 +32,9 @@ impl Contract {
     }
 
     #[pause]
+    #[access_control_any(roles(Role::DAO))]
     #[payable]
     pub fn remove_beneficiary(&mut self, account_id: AccountId) {
-        self.assert_owner();
         assert_one_yocto();
         self.data_mut().beneficiaries.remove(&account_id);
         Event::RemoveBeneficiary {
@@ -58,9 +45,9 @@ impl Contract {
 
     /// Set whitelist account ID
     #[pause]
+    #[access_control_any(roles(Role::DAO))]
     #[payable]
     pub fn set_whitelist_contract_id(&mut self, account_id: AccountId) {
-        self.assert_owner();
         assert_one_yocto();
         self.data_mut().whitelist_account_id = Some(account_id.clone());
         Event::SetWhitelist {

@@ -15,7 +15,9 @@ impl FungibleTokenCore for Contract {
         memo: Option<String>,
         msg: String,
     ) -> PromiseOrValue<U128> {
-        self.data_mut().token.ft_transfer_call(receiver_id, amount, memo, msg)
+        self.data_mut()
+            .token
+            .ft_transfer_call(receiver_id, amount, memo, msg)
     }
 
     fn ft_total_supply(&self) -> U128 {
@@ -37,7 +39,8 @@ impl FungibleTokenResolver for Contract {
         amount: U128,
     ) -> U128 {
         let (used_amount, burned_amount) =
-            self.data_mut().token
+            self.data_mut()
+                .token
                 .internal_ft_resolve_transfer(&sender_id, receiver_id, amount);
         if burned_amount > 0 {
             log!("Account @{} burned {}", sender_id, burned_amount);

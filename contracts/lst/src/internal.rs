@@ -1,13 +1,6 @@
 use crate::*;
 
 impl Contract {
-    pub(crate) fn assert_owner(&self) {
-        require!(
-            env::predecessor_account_id() == self.data().owner_id,
-            ERR_NOT_OWNER
-        );
-    }
-
     pub(crate) fn internal_get_beneficiaries(&self) -> HashMap<AccountId, u32> {
         self.data()
             .beneficiaries

@@ -14,7 +14,9 @@ impl StorageManagement for Contract {
                 .accounts
                 .insert(acc_id.clone(), Account::default());
         }
-        self.data_mut().token.storage_deposit(account_id, registration_only)
+        self.data_mut()
+            .token
+            .storage_deposit(account_id, registration_only)
     }
 
     #[payable]
@@ -25,11 +27,16 @@ impl StorageManagement for Contract {
     /// force unregister is not allowed here,
     /// return true only if both account and token.account are empty.
     #[payable]
-     fn storage_unregister(&mut self, force: Option<bool>) -> bool {
-        require!(force.is_none() || force.unwrap() == false, ERR_FORCE_UNGREGISTER);
-        if let Some((account_id, balance)) = self.data_mut().token.internal_storage_unregister(None) {
+    fn storage_unregister(&mut self, force: Option<bool>) -> bool {
+        require!(force.is_none() || !force.unwrap(), ERR_FORCE_UNGREGISTER);
+        if let Some((account_id, balance)) = self.data_mut().token.internal_storage_unregister(None)
+        {
             // still need to check account
-            let account = self.data_mut().accounts.remove(&account_id).unwrap_or(Account::default());
+            let account = self
+                .data_mut()
+                .accounts
+                .remove(&account_id)
+                .unwrap_or_default();
             require!(account.unstaked == 0, ERR_UNREGISTER_POSITIVE_UNSTAKED);
             log!("Closed @{} with {}", account_id, balance);
             true

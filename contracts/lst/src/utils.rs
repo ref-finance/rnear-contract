@@ -69,20 +69,6 @@ pub struct RewardFeeFraction {
     pub denominator: u32,
 }
 
-impl RewardFeeFraction {
-    pub fn assert_valid(&self) {
-        assert_ne!(self.denominator, 0, "Denominator must be a positive number");
-        assert!(
-            self.numerator <= self.denominator,
-            "The reward fee must be less or equal to 1"
-        );
-    }
-
-    pub fn multiply(&self, value: u128) -> u128 {
-        (U256::from(self.numerator) * U256::from(value) / U256::from(self.denominator)).as_u128()
-    }
-}
-
 #[cfg(not(feature = "test"))]
 pub fn get_epoch_height() -> EpochHeight {
     env::epoch_height()
@@ -120,7 +106,6 @@ impl Contract {
     /// Add epoch rewards method, only available for testing
     #[cfg(feature = "test")]
     pub fn add_epoch_rewards(&mut self, amount: U128) {
-        self.assert_owner();
         let amount: u128 = amount.into();
         require!(amount > 0, "Added rewards amount must be positive");
         self.data_mut().total_staked_near_amount += amount;
