@@ -112,7 +112,11 @@ impl ValidatorPool {
             let validator: Validator = validator.into();
             total_staked_amount += validator.staked_amount;
 
-            if !validator.pending_release() && validator.staked_amount > 0 {
+            if !validator.pending_release()
+                && !validator.executing
+                && validator.weight > 0
+                && validator.staked_amount > 0
+            {
                 available_amount += validator.staked_amount;
             }
 
@@ -135,6 +139,22 @@ impl ValidatorPool {
 }
 
 impl ValidatorPool {
+    fn allocatable_staked_amount(&self, total_staked_near_amount: u128) -> u128 {
+        let isolated_balance = self
+            .validators
+            .values()
+            .map(Validator::from)
+            .filter(|validator| validator.weight == 0)
+            .fold(0_u128, |total, validator| {
+                total.saturating_add(
+                    validator
+                        .staked_amount
+                        .saturating_add(validator.unstaked_amount),
+                )
+            });
+        total_staked_near_amount.saturating_sub(isolated_balance)
+    }
+
     pub fn get_candidate_to_stake(
         &self,
         amount: u128,
@@ -170,19 +190,21 @@ impl ValidatorPool {
 
     fn filter_candidate_validators(
         &self,
-        total_staked_near_amount: u128,
+        allocatable_amount: u128,
     ) -> Vec<(Validator, u128, u128)> {
         self.validators
             .values()
             .map(|versioned_validator| {
                 let validator = Validator::from(versioned_validator);
                 let target_amount =
-                    self.validator_target_stake_amount(total_staked_near_amount, &validator);
+                    self.validator_target_stake_amount(allocatable_amount, &validator);
                 (validator, target_amount)
             })
             .filter(|(validator, target_amount)| {
                 // validator is not in pending release
                 !validator.pending_release()
+                    && !validator.executing
+                    && validator.weight > 0
                     // delta must > 0
                     && validator.staked_amount > *target_amount
             })
@@ -238,7 +260,8 @@ impl ValidatorPool {
         total_amount_to_unstake: u128,
         total_staked_near_amount: u128,
     ) -> Option<CandidateValidator> {
-        let mut candidate_validators = self.filter_candidate_validators(total_staked_near_amount);
+        let allocatable_amount = self.allocatable_staked_amount(total_staked_near_amount);
+        let mut candidate_validators = self.filter_candidate_validators(allocatable_amount);
         if candidate_validators.is_empty() {
             return None;
         }
@@ -267,11 +290,10 @@ impl ValidatorPool {
                     max(target_amount / 2, *delta),
                     // guaranteed minimum staked amount even if `total_staked_near_amount` is less than `total_base_stake_amount`
                     validator.staked_amount.saturating_sub(min(
-                        (U256::from(validator.base_stake_amount)
-                            * U256::from(total_staked_near_amount))
-                        .checked_div(U256::from(self.total_base_stake_amount))
-                        .unwrap_or_default()
-                        .as_u128(),
+                        (U256::from(validator.base_stake_amount) * U256::from(allocatable_amount))
+                            .checked_div(U256::from(self.total_base_stake_amount))
+                            .unwrap_or_default()
+                            .as_u128(),
                         validator.base_stake_amount,
                     )),
                 );

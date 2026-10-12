@@ -166,28 +166,10 @@ impl Validator {
         pool.save_validator(self);
     }
 
-    pub fn refresh_total_balance(&mut self, pool: &mut ValidatorPool) -> Promise {
-        self.pre_execution(pool);
-
-        ext_staking_pool::ext(self.account_id.clone())
-            .with_static_gas(GAS_EXT_GET_BALANCE)
-            .get_account_total_balance(env::current_account_id())
-    }
-
-    pub fn on_new_total_balance(&mut self, pool: &mut ValidatorPool, new_total_balance: u128) {
-        self.post_execution(pool);
-
-        // sync base stake amount
-        self.sync_base_stake_amount(pool, new_total_balance);
-        // update staked amount
-        self.staked_amount = new_total_balance - self.unstaked_amount;
-        pool.save_validator(self);
-    }
-
     pub fn on_get_account_total_balance_failed(&mut self, pool: &mut ValidatorPool) {
         self.post_execution(pool);
     }
-    
+
     /// Due to shares calculation and rounding of staking pool contract,
     /// the amount of staked and unstaked balance might be a little bit
     /// different than we requested.

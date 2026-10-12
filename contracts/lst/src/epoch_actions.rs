@@ -200,7 +200,7 @@ impl Contract {
     #[pause]
     pub fn epoch_update_rewards(&mut self, validator_id: AccountId) {
         let min_gas = GAS_EPOCH_UPDATE_REWARDS.as_gas()
-            + GAS_EXT_GET_BALANCE.as_gas()
+            + GAS_EXT_GET_ACCOUNT.as_gas()
             + GAS_CB_VALIDATOR_GET_BALANCE.as_gas();
         require!(
             env::prepaid_gas().as_gas() >= min_gas,
@@ -214,11 +214,11 @@ impl Contract {
             .expect(ERR_VALIDATOR_NOT_EXIST);
 
         validator
-            .refresh_total_balance(&mut self.data_mut().validator_pool)
+            .sync_account_balance(&mut self.data_mut().validator_pool, false)
             .then(
                 Self::ext(env::current_account_id())
                     .with_static_gas(GAS_CB_VALIDATOR_GET_BALANCE)
-                    .validator_get_balance_callback(validator.account_id),
+                    .validator_reward_account_callback(validator.account_id),
             );
     }
 
@@ -366,7 +366,28 @@ impl Contract {
     pub fn validator_get_balance_callback(
         &mut self,
         validator_id: AccountId,
-        #[callback_result] call_result: Result<U128, PromiseError>,
+        #[callback_result] _call_result: Result<U128, PromiseError>,
+    ) {
+        let mut validator = self
+            .data_mut()
+            .validator_pool
+            .get_validator(&validator_id)
+            .expect(ERR_VALIDATOR_NOT_EXIST);
+        if validator.executing {
+            Event::EpochUpdateRewardsFailed {
+                validator_id: &validator_id,
+                reason: "legacy_callback_retry",
+            }
+            .emit();
+            validator.on_get_account_total_balance_failed(&mut self.data_mut().validator_pool);
+        }
+    }
+
+    #[private]
+    pub fn validator_reward_account_callback(
+        &mut self,
+        validator_id: AccountId,
+        #[callback_result] call_result: Result<HumanReadableAccount, PromiseError>,
     ) {
         let mut validator = self
             .data_mut()
@@ -374,27 +395,13 @@ impl Contract {
             .get_validator(&validator_id)
             .expect(ERR_VALIDATOR_NOT_EXIST);
         match call_result {
-            Ok(total_balance) => {
-                let new_balance = total_balance.0;
-                let rewards = new_balance - validator.total_balance();
-                Event::EpochUpdateRewards {
+            Ok(account) => self.reconcile_reward_balance(validator, account),
+            Err(_) => {
+                Event::EpochUpdateRewardsFailed {
                     validator_id: &validator_id,
-                    old_balance: &U128(validator.total_balance()),
-                    new_balance: &U128(new_balance),
-                    rewards: &U128(rewards),
+                    reason: "validator_call_failed",
                 }
                 .emit();
-
-                validator.on_new_total_balance(&mut self.data_mut().validator_pool, new_balance);
-
-                if rewards == 0 {
-                    return;
-                }
-
-                self.data_mut().total_staked_near_amount += rewards;
-                self.internal_distribute_staking_rewards(rewards);
-            }
-            Err(_) => {
                 validator.on_get_account_total_balance_failed(&mut self.data_mut().validator_pool);
             }
         }

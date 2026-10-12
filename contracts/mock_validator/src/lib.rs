@@ -149,6 +149,18 @@ impl Contract {
         self.staked_delta = staked_delta.0;
         self.unstaked_delta = unstaked_delta.0;
     }
+
+    pub fn slash(&mut self, account_id: AccountId, staked_loss: U128, unstaked_loss: U128) {
+        let staked = self.internal_get_staked(&account_id);
+        let unstaked = self.internal_get_unstaked_deposit(&account_id);
+        require!(
+            staked >= staked_loss.0 && unstaked >= unstaked_loss.0,
+            "Invalid slash"
+        );
+        self.staked
+            .insert(account_id.clone(), staked - staked_loss.0);
+        self.deposits.insert(account_id, unstaked - unstaked_loss.0);
+    }
 }
 
 impl Contract {

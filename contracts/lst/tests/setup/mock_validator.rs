@@ -3,6 +3,25 @@ use crate::*;
 pub struct MockValidatorContract(pub Contract);
 
 impl MockValidatorContract {
+    pub async fn slash(
+        &self,
+        caller: &Account,
+        account_id: &AccountId,
+        staked_loss: u128,
+        unstaked_loss: u128,
+    ) -> Result<ExecutionFinalResult> {
+        caller
+            .call(self.0.id(), "slash")
+            .args_json(json!({
+                "account_id": account_id,
+                "staked_loss": staked_loss.to_string(),
+                "unstaked_loss": unstaked_loss.to_string(),
+            }))
+            .max_gas()
+            .transact()
+            .await
+    }
+
     pub async fn get_account_staked_balance(&self, account_id: &AccountId) -> Result<U128> {
         self.0
             .call("get_account_staked_balance")
@@ -30,7 +49,12 @@ impl MockValidatorContract {
 
 /// test stub
 impl MockValidatorContract {
-    pub async fn set_balance_delta(&self, caller: &Account, staked_delta: u128, unstaked_delta: u128) -> Result<ExecutionFinalResult> {
+    pub async fn set_balance_delta(
+        &self,
+        caller: &Account,
+        staked_delta: u128,
+        unstaked_delta: u128,
+    ) -> Result<ExecutionFinalResult> {
         caller
             .call(self.0.id(), "set_balance_delta")
             .args_json(json!({
@@ -53,7 +77,11 @@ impl MockValidatorContract {
             .await
     }
 
-    pub async fn set_get_account_fail(&self, caller: &Account, value: bool) -> Result<ExecutionFinalResult> {
+    pub async fn set_get_account_fail(
+        &self,
+        caller: &Account,
+        value: bool,
+    ) -> Result<ExecutionFinalResult> {
         caller
             .call(self.0.id(), "set_get_account_fail")
             .args_json(json!({

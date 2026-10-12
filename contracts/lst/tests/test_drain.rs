@@ -40,7 +40,6 @@ async fn test_drain_constraints() {
     // 1. cannot drain unstake when weight > 0
     check!(context.lst_contract.drain_unstake(&context.root, v1.0.id()), lst::ERR_NON_ZERO_WEIGHT);
 
-    // set weight to 0
     check!(context.lst_contract.update_weight(&context.root, v1.0.id(), 0));
 
     // 2. cannot drain unstake when base stake amount > 0
@@ -48,6 +47,9 @@ async fn test_drain_constraints() {
 
     // update base stake amount to 0 NEAR
     check!(context.lst_contract.update_base_stake_amounts(&context.root, vec![v1.0.id()], vec![0_u128]));
+
+    // Restore eligibility for normal epoch unstake.
+    check!(context.lst_contract.update_weight(&context.root, v1.0.id(), 10));
 
     // fast-forward
     check!(context.lst_contract.set_epoch_height(&context.root, 11));
@@ -59,6 +61,9 @@ async fn test_drain_constraints() {
 
     // validator now have unstaked balance > 0
     context.check_validator_amount(&v1, NearToken::from_near(10).as_yoctonear(), NearToken::from_near(50).as_yoctonear(), None, None).await;
+
+    // set weight to 0 after normal unstake; zero-weight validators are excluded from epoch selection
+    check!(context.lst_contract.update_weight(&context.root, v1.0.id(), 0));
 
     // -- 3. cannot drain unstake when pending release
     check!(context.lst_contract.drain_unstake(&context.root, v1.0.id()), lst::ERR_VALIDATOR_UNSTAKE_WHEN_LOCKED);

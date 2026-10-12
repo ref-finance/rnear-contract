@@ -51,6 +51,20 @@ pub enum Event<'a> {
         new_balance: &'a U128,
         rewards: &'a U128,
     },
+    EpochUpdateRewardsFailed {
+        validator_id: &'a AccountId,
+        reason: &'a str,
+    },
+    EpochUpdateLoss {
+        validator_id: &'a AccountId,
+        old_staked_balance: &'a U128,
+        old_unstaked_balance: &'a U128,
+        new_staked_balance: &'a U128,
+        new_unstaked_balance: &'a U128,
+        loss: &'a U128,
+        uncovered_loss: &'a U128,
+        total_staked_near_amount: &'a U128,
+    },
     EpochCleanup {
         stake_amount_to_settle: &'a U128,
         unstake_amount_to_settle: &'a U128,
