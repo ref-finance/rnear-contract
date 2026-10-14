@@ -12,6 +12,10 @@ pub struct Context {
 impl Context {
     pub async fn new(worker: &Worker<Sandbox>, wasm_path: Option<&str>) -> Self {
         let root = worker.root_account().unwrap();
+        let lst_wasm_path = wasm_path
+            .map(str::to_owned)
+            .or_else(|| std::env::var("LST_WASM_PATH").ok())
+            .unwrap_or_else(|| "../../res/lst.wasm".to_string());
         let (lst_contract, mock_whitelist) = tokio::join!(
             async {
                 let lst = root
@@ -21,10 +25,7 @@ impl Context {
                     .await
                     .unwrap()
                     .unwrap();
-                lst.deploy(&std::fs::read(wasm_path.unwrap_or("../../res/lst.wasm")).unwrap())
-                    .await
-                    .unwrap()
-                    .unwrap()
+                lst.deploy(&std::fs::read(&lst_wasm_path).unwrap()).await.unwrap().unwrap()
             },
             async {
                 let whitelist = root
@@ -71,12 +72,10 @@ impl Context {
             .call(lst_contract.id(), "new")
             .args_json(json!({
                 "owner_id": root.id(),
+                "wnear_id": "wrap.near",
             }))
             .transact());
-        check!(root
-            .call(mock_whitelist.id(), "new")
-            .args_json(json!({}))
-            .transact());
+        check!(root.call(mock_whitelist.id(), "new").args_json(json!({})).transact());
         check!(root
             .call(lst_contract.id(), "set_whitelist_contract_id")
             .args_json(json!({
@@ -105,16 +104,9 @@ impl Context {
                 .await
                 .unwrap()
                 .unwrap();
-            v.deploy(&std::fs::read("../../res/mock_validator.wasm").unwrap())
-                .await
-                .unwrap()
-                .unwrap()
+            v.deploy(&std::fs::read("../../res/mock_validator.wasm").unwrap()).await.unwrap().unwrap()
         },);
-        check!(self
-            .root
-            .call(v_contract.id(), "new")
-            .args_json(json!({}))
-            .transact());
+        check!(self.root.call(v_contract.id(), "new").args_json(json!({})).transact());
         MockValidatorContract(v_contract)
     }
 }

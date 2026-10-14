@@ -53,9 +53,7 @@ impl Contract {
     }
 
     pub(crate) fn internal_save_account(&mut self, account_id: &AccountId, account: &Account) {
-        self.data_mut()
-            .accounts
-            .insert(account_id.clone(), account.clone());
+        self.data_mut().accounts.insert(account_id.clone(), account.clone());
     }
 
     #[pause]
@@ -79,23 +77,12 @@ impl Contract {
         require!(amount > 0, ERR_NON_POSITIVE_WITHDRAWAL_AMOUNT);
 
         let account = self.internal_get_account(account_id);
-        require!(
-            account.unstaked >= amount,
-            ERR_NO_ENOUGH_UNSTAKED_BALANCE_TO_WITHDRAW
-        );
+        require!(account.unstaked >= amount, ERR_NO_ENOUGH_UNSTAKED_BALANCE_TO_WITHDRAW);
         require!(
             account.unstaked_available_epoch_height <= get_epoch_height(),
             ERR_UNSTAKED_BALANCE_NOT_AVAILABLE
         );
-        // Make sure the contract has enough NEAR for user to withdraw,
-        // Note that account locked balance should not be included.
-        let available_balance = env::account_balance();
-        // at least 1 NEAR should be left to cover storage/gas.
-        require!(
-            available_balance.saturating_sub(CONTRACT_MIN_RESERVE_BALANCE)
-                >= NearToken::from_yoctonear(amount),
-            ERR_NO_ENOUGH_CONTRACT_BALANCE
-        );
+        require!(self.available_near() >= amount, ERR_NO_ENOUGH_CONTRACT_BALANCE);
     }
 
     #[pause]
@@ -161,10 +148,7 @@ impl Contract {
         let account_id = env::predecessor_account_id();
         let mut account = self.internal_get_account(&account_id);
 
-        require!(
-            self.data().total_staked_near_amount > 0,
-            ERR_CONTRACT_NO_STAKED_BALANCE
-        );
+        require!(self.data().total_staked_near_amount > 0, ERR_CONTRACT_NO_STAKED_BALANCE);
         // Calculate the number of shares required to unstake the given amount.
         // NOTE: The number of shares the account will pay is rounded up.
         let num_shares = self.num_shares_from_staked_amount_rounded_up(amount);
@@ -173,8 +157,7 @@ impl Contract {
         self.burn_lst(&account_id, num_shares, Some("unstake"));
 
         account.unstaked += amount;
-        account.unstaked_available_epoch_height =
-            get_epoch_height() + self.data().validator_pool.get_num_epoch_to_unstake(amount);
+        account.unstaked_available_epoch_height = get_epoch_height() + self.data().validator_pool.get_num_epoch_to_unstake(amount);
         if self.data().last_settlement_epoch == get_epoch_height() {
             // The unstake request is received after epoch_cleanup
             // so actual unstake will happen in the next epoch,

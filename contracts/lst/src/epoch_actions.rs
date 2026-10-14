@@ -68,10 +68,10 @@ impl Contract {
             return PromiseOrValue::Value(false);
         }
 
-        let candidate = self.data().validator_pool.get_candidate_to_stake(
-            self.data().stake_amount_to_settle,
-            self.data().total_staked_near_amount,
-        );
+        let candidate = self
+            .data()
+            .validator_pool
+            .get_candidate_to_stake(self.data().stake_amount_to_settle, self.data().total_staked_near_amount);
 
         if candidate.is_none() {
             log!("no candidate found to stake");
@@ -86,11 +86,7 @@ impl Contract {
             return PromiseOrValue::Value(false);
         }
 
-        require!(
-            env::account_balance().as_yoctonear()
-                >= amount_to_stake + CONTRACT_MIN_RESERVE_BALANCE.as_yoctonear(),
-            ERR_MIN_RESERVE
-        );
+        require!(self.available_near() >= amount_to_stake, ERR_MIN_RESERVE);
 
         // update internal state
         self.data_mut().stake_amount_to_settle -= amount_to_stake;
@@ -114,10 +110,7 @@ impl Contract {
                             .checked_add(GAS_CB_VALIDATOR_SYNC_BALANCE)
                             .unwrap(),
                     )
-                    .validator_staked_callback(
-                        candidate.validator.account_id.clone(),
-                        amount_to_stake.into(),
-                    ),
+                    .validator_staked_callback(candidate.validator.account_id.clone(), amount_to_stake.into()),
             )
             .into()
     }
@@ -153,10 +146,10 @@ impl Contract {
             return PromiseOrValue::Value(false);
         }
 
-        let candidate = self.data().validator_pool.get_candidate_to_unstake_v2(
-            self.data().unstake_amount_to_settle,
-            self.data().total_staked_near_amount,
-        );
+        let candidate = self
+            .data()
+            .validator_pool
+            .get_candidate_to_unstake_v2(self.data().unstake_amount_to_settle, self.data().total_staked_near_amount);
         if candidate.is_none() {
             log!("no candidate found to unstake");
             return PromiseOrValue::Value(false);
@@ -189,55 +182,38 @@ impl Contract {
                             .checked_add(GAS_CB_VALIDATOR_SYNC_BALANCE)
                             .unwrap(),
                     )
-                    .validator_unstaked_callback(
-                        candidate.validator.account_id,
-                        amount_to_unstake.into(),
-                    ),
+                    .validator_unstaked_callback(candidate.validator.account_id, amount_to_unstake.into()),
             )
             .into()
     }
 
     #[pause]
     pub fn epoch_update_rewards(&mut self, validator_id: AccountId) {
-        let min_gas = GAS_EPOCH_UPDATE_REWARDS.as_gas()
-            + GAS_EXT_GET_BALANCE.as_gas()
-            + GAS_CB_VALIDATOR_GET_BALANCE.as_gas();
+        let min_gas = GAS_EPOCH_UPDATE_REWARDS.as_gas() + GAS_EXT_GET_BALANCE.as_gas() + GAS_CB_VALIDATOR_GET_BALANCE.as_gas();
         require!(
             env::prepaid_gas().as_gas() >= min_gas,
             format!("{}. require at least {:?}", ERR_NO_ENOUGH_GAS, min_gas)
         );
 
-        let mut validator = self
-            .data_mut()
-            .validator_pool
-            .get_validator(&validator_id)
-            .expect(ERR_VALIDATOR_NOT_EXIST);
+        let mut validator = self.data_mut().validator_pool.get_validator(&validator_id).expect(ERR_VALIDATOR_NOT_EXIST);
 
-        validator
-            .refresh_total_balance(&mut self.data_mut().validator_pool)
-            .then(
-                Self::ext(env::current_account_id())
-                    .with_static_gas(GAS_CB_VALIDATOR_GET_BALANCE)
-                    .validator_get_balance_callback(validator.account_id),
-            );
+        validator.refresh_total_balance(&mut self.data_mut().validator_pool).then(
+            Self::ext(env::current_account_id())
+                .with_static_gas(GAS_CB_VALIDATOR_GET_BALANCE)
+                .validator_get_balance_callback(validator.account_id),
+        );
     }
 
     #[pause]
     pub fn epoch_withdraw(&mut self, validator_id: AccountId) {
         // make sure enough gas was given
-        let min_gas = GAS_EPOCH_WITHDRAW.as_gas()
-            + GAS_EXT_WITHDRAW.as_gas()
-            + GAS_CB_VALIDATOR_WITHDRAW.as_gas();
+        let min_gas = GAS_EPOCH_WITHDRAW.as_gas() + GAS_EXT_WITHDRAW.as_gas() + GAS_CB_VALIDATOR_WITHDRAW.as_gas();
         require!(
             env::prepaid_gas().as_gas() >= min_gas,
             format!("{}. require at least {:?}", ERR_NO_ENOUGH_GAS, min_gas)
         );
 
-        let mut validator = self
-            .data_mut()
-            .validator_pool
-            .get_validator(&validator_id)
-            .expect(ERR_VALIDATOR_NOT_EXIST);
+        let mut validator = self.data_mut().validator_pool.get_validator(&validator_id).expect(ERR_VALIDATOR_NOT_EXIST);
 
         require!(!validator.draining, ERR_DRAINING);
 
@@ -249,13 +225,11 @@ impl Contract {
         }
         .emit();
 
-        validator
-            .withdraw(&mut self.data_mut().validator_pool, amount)
-            .then(
-                Self::ext(env::current_account_id())
-                    .with_static_gas(GAS_CB_VALIDATOR_WITHDRAW)
-                    .validator_withdraw_callback(validator.account_id.clone(), amount.into()),
-            );
+        validator.withdraw(&mut self.data_mut().validator_pool, amount).then(
+            Self::ext(env::current_account_id())
+                .with_static_gas(GAS_CB_VALIDATOR_WITHDRAW)
+                .validator_withdraw_callback(validator.account_id.clone(), amount.into()),
+        );
     }
 }
 
@@ -266,11 +240,7 @@ impl Contract {
     /// * `true` - Stake and sync balance succeed
     /// * `false` - Stake fails
     #[private]
-    pub fn validator_staked_callback(
-        &mut self,
-        validator_id: AccountId,
-        amount: U128,
-    ) -> PromiseOrValue<bool> {
+    pub fn validator_staked_callback(&mut self, validator_id: AccountId, amount: U128) -> PromiseOrValue<bool> {
         let amount = amount.into();
         let mut validator = self
             .data_mut()
@@ -315,11 +285,7 @@ impl Contract {
     /// * `true` - Unstake and sync balance succeed
     /// * `false` - Unstake fails
     #[private]
-    pub fn validator_unstaked_callback(
-        &mut self,
-        validator_id: AccountId,
-        amount: U128,
-    ) -> PromiseOrValue<bool> {
+    pub fn validator_unstaked_callback(&mut self, validator_id: AccountId, amount: U128) -> PromiseOrValue<bool> {
         let amount = amount.into();
         let mut validator = self
             .data_mut()
@@ -363,16 +329,8 @@ impl Contract {
     }
 
     #[private]
-    pub fn validator_get_balance_callback(
-        &mut self,
-        validator_id: AccountId,
-        #[callback_result] call_result: Result<U128, PromiseError>,
-    ) {
-        let mut validator = self
-            .data_mut()
-            .validator_pool
-            .get_validator(&validator_id)
-            .expect(ERR_VALIDATOR_NOT_EXIST);
+    pub fn validator_get_balance_callback(&mut self, validator_id: AccountId, #[callback_result] call_result: Result<U128, PromiseError>) {
+        let mut validator = self.data_mut().validator_pool.get_validator(&validator_id).expect(ERR_VALIDATOR_NOT_EXIST);
         match call_result {
             Ok(total_balance) => {
                 let new_balance = total_balance.0;
@@ -405,11 +363,7 @@ impl Contract {
     /// Params:
     /// - validator_id: the validator to sync balance
     #[private]
-    pub fn validator_get_account_callback(
-        &mut self,
-        validator_id: AccountId,
-        #[callback_result] result: Result<HumanReadableAccount, PromiseError>,
-    ) -> bool {
+    pub fn validator_get_account_callback(&mut self, validator_id: AccountId, #[callback_result] result: Result<HumanReadableAccount, PromiseError>) -> bool {
         let mut validator = self
             .data_mut()
             .validator_pool
@@ -420,19 +374,10 @@ impl Contract {
             Ok(account) => {
                 // allow at most max_sync_balance_diff diff in total balance, staked balance and unstake balance
                 let new_total_balance = account.staked_balance.0 + account.unstaked_balance.0;
-                if abs_diff_eq(
-                    new_total_balance,
-                    validator.total_balance(),
-                    MAX_SYNC_BALANCE_DIFF,
-                ) && abs_diff_eq(
-                    account.staked_balance.0,
-                    validator.staked_amount,
-                    MAX_SYNC_BALANCE_DIFF,
-                ) && abs_diff_eq(
-                    account.unstaked_balance.0,
-                    validator.unstaked_amount,
-                    MAX_SYNC_BALANCE_DIFF,
-                ) {
+                if abs_diff_eq(new_total_balance, validator.total_balance(), MAX_SYNC_BALANCE_DIFF)
+                    && abs_diff_eq(account.staked_balance.0, validator.staked_amount, MAX_SYNC_BALANCE_DIFF)
+                    && abs_diff_eq(account.unstaked_balance.0, validator.unstaked_amount, MAX_SYNC_BALANCE_DIFF)
+                {
                     Event::SyncValidatorBalanceSuccess {
                         validator_id: &validator_id,
                         old_staked_balance: &validator.staked_amount.into(),
@@ -443,11 +388,7 @@ impl Contract {
                         new_total_balance: &new_total_balance.into(),
                     }
                     .emit();
-                    validator.on_sync_account_balance_success(
-                        &mut self.data_mut().validator_pool,
-                        account.staked_balance.0,
-                        account.unstaked_balance.0,
-                    );
+                    validator.on_sync_account_balance_success(&mut self.data_mut().validator_pool, account.staked_balance.0, account.unstaked_balance.0);
                 } else {
                     Event::SyncValidatorBalanceFailedLargeDiff {
                         validator_id: &validator_id,
