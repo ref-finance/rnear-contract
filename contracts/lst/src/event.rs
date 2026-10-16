@@ -260,6 +260,11 @@ pub enum Event<'a> {
         platform_id: &'a AccountId,
         amount: U128,
     },
+    StakeRefundQueued {
+        platform_id: &'a AccountId,
+        request_key: Base58CryptoHash,
+        amount: U128,
+    },
     PlatformStakeDeliveryRefunded {
         platform_id: &'a AccountId,
         receiver_id: &'a AccountId,

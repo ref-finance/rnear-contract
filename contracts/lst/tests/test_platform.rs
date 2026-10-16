@@ -1,4 +1,5 @@
 mod setup;
+use near_sdk::json_types::Base58CryptoHash;
 use setup::*;
 
 async fn setup_fault_case_with_reserve(fund_reserve: bool) -> (Worker<Sandbox>, Account, Contract, Contract, Contract) {
@@ -1430,6 +1431,92 @@ async fn plan_a_rewrap_failure_does_not_refund_from_shared_wnear() {
         .unwrap();
     assert_eq!(status.storage_reserved_bytes, 0);
     assert_eq!(status.inflight_storage_operations, 0);
+}
+
+#[tokio::test]
+async fn rewrap_failure_queues_immediate_refund_and_withdraws_reserved_near() {
+    let (_worker, root, lst, wnear, platform) = setup_fault_case().await;
+    seed_shared_wnear(&platform, &wnear, &lst).await;
+    let shared = NearToken::from_near(10).as_yoctonear();
+    let amount = NearToken::from_near(5).as_yoctonear();
+    let route = json!({"receiver_id": platform.id(), "withdraw_tokens": {"wnear": {"msg": "0"}}});
+    let key: Base58CryptoHash = lst
+        .call("get_request_key")
+        .args_json(json!({"args": route}))
+        .view()
+        .await
+        .unwrap()
+        .json()
+        .unwrap();
+    let message = json!({"receiver_id": platform.id(), "msg": "0", "memo": "__force_rewrap__", "refund_message": route});
+    let fail_wrap = root
+        .call(wnear.id(), "set_fail_next_deposit")
+        .args_json(json!({"fail": true}))
+        .transact()
+        .await
+        .unwrap();
+    assert!(fail_wrap.is_success(), "{fail_wrap:?}");
+    let failed = stake_wnear(&platform, &wnear, &lst, amount, message, 150).await;
+    assert!(failed.is_success(), "{failed:?}");
+    assert!(failed.logs().iter().any(|log| log.contains("\"event\":\"stake_refund_queued\"")));
+    assert_eq!(token_balance(&wnear, lst.id()).await, shared);
+    let request: lst::WithdrawalRequestView = lst
+        .call("get_withdrawal_request")
+        .args_json(json!({"platform_id": platform.id(), "request_key": key}))
+        .view()
+        .await
+        .unwrap()
+        .json::<Option<_>>()
+        .unwrap()
+        .unwrap();
+    assert_eq!(request.tranches.len(), 1);
+    assert_eq!(request.tranches[0].amount.0, amount);
+    assert_eq!(request.tranches[0].refund_near.0, amount);
+    assert_eq!(request.tranches[0].wnear_residual.0, 0);
+    assert!(request.tranches[0].matured);
+    let reserved: U128 = lst.call("get_refund_near_reserved").view().await.unwrap().json().unwrap();
+    assert_eq!(reserved.0, amount);
+
+    let failed_withdrawal = root
+        .call(lst.id(), "withdraw_request")
+        .args_json(json!({"platform_id": platform.id(), "request_key": key}))
+        .gas(Gas::from_tgas(200))
+        .transact()
+        .await
+        .unwrap();
+    assert!(failed_withdrawal.is_success(), "{failed_withdrawal:?}");
+    let request: Option<lst::WithdrawalRequestView> = lst
+        .call("get_withdrawal_request")
+        .args_json(json!({"platform_id": platform.id(), "request_key": key}))
+        .view()
+        .await
+        .unwrap()
+        .json()
+        .unwrap();
+    assert!(request.unwrap().tranches.iter().any(|tranche| !tranche.locked && tranche.refund_near.0 == amount));
+    let reserved: U128 = lst.call("get_refund_near_reserved").view().await.unwrap().json().unwrap();
+    assert_eq!(reserved.0, amount);
+
+    let restore = root
+        .call(wnear.id(), "set_fail_next_deposit")
+        .args_json(json!({"fail": false}))
+        .transact()
+        .await
+        .unwrap();
+    assert!(restore.is_success(), "{restore:?}");
+    let withdrawn = root
+        .call(lst.id(), "withdraw_request")
+        .args_json(json!({"platform_id": platform.id(), "request_key": key}))
+        .gas(Gas::from_tgas(200))
+        .transact()
+        .await
+        .unwrap();
+    assert!(withdrawn.is_success(), "{withdrawn:?}");
+    assert_eq!(token_balance(&wnear, lst.id()).await, shared);
+    let reserved: U128 = lst.call("get_refund_near_reserved").view().await.unwrap().json().unwrap();
+    assert_eq!(reserved.0, 0);
+    let pending: U128 = lst.call("get_total_pending_withdrawal_amount").view().await.unwrap().json().unwrap();
+    assert_eq!(pending.0, 0);
 }
 
 #[tokio::test]

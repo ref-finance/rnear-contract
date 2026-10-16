@@ -82,6 +82,7 @@ fn unclear_transfer_result_keeps_request_locked() {
                     amount: ONE_NEAR,
                     available_epoch_height: 0,
                     wnear_residual: ONE_NEAR,
+                    refund_near: 0,
                 },
                 amount_to_send: ONE_NEAR,
             }],
@@ -138,6 +139,7 @@ fn reserved_refund_can_fill_the_sixteenth_tranche() {
                         amount: ONE_NEAR,
                         available_epoch_height: 100 + index as u64,
                         wnear_residual: 0,
+                        refund_near: 0,
                     })
                 })
                 .collect(),
@@ -205,6 +207,7 @@ fn failed_wrap_unlocks_withdrawal_without_recording_wnear() {
                     amount: ONE_NEAR,
                     available_epoch_height: 0,
                     wnear_residual: 0,
+                    refund_near: 0,
                 },
                 amount_to_wrap: ONE_NEAR,
             }],
@@ -250,6 +253,7 @@ fn wrapping_recovery_records_confirmed_wnear_once() {
                     amount: ONE_NEAR,
                     available_epoch_height: 0,
                     wnear_residual: 0,
+                    refund_near: 0,
                 },
                 amount_to_wrap: ONE_NEAR,
             }],
@@ -265,6 +269,107 @@ fn wrapping_recovery_records_confirmed_wnear_once() {
     }));
     assert!(repeated.is_err());
     assert_eq!(contract.load_request(&key).tranches[0].unlocked().unwrap().wnear_residual, ONE_NEAR);
+}
+
+#[test]
+fn failed_rewrap_stays_separate_and_can_withdraw_before_ordinary_tranche() {
+    let (mut contract, mut context, platform) = setup();
+    context.attached_deposit(NearToken::from_near(1));
+    testing_env!(context.build());
+    contract.deposit_platform_user_storage(platform.clone());
+    let message = UnstakeMessage {
+        receiver_id: platform.clone(),
+        withdraw_tokens: WithdrawTokens::Wnear {
+            is_storage_deposit: false,
+            msg: "0".to_string(),
+            memo: None,
+            min_gas: None,
+        },
+    };
+    let key = PlatformRequestKey {
+        platform_id: platform.clone(),
+        request_key: Contract::request_key(&message),
+    };
+    contract.save_request(
+        &key,
+        Some(WithdrawalRequest {
+            message: message.clone(),
+            tranches: vec![TrancheLock::Unlocked(WithdrawalTranche {
+                amount: 20 * ONE_NEAR,
+                available_epoch_height: get_epoch_height(),
+                wnear_residual: 0,
+                refund_near: 0,
+            })],
+        }),
+    );
+    contract.data_mut().total_pending_withdrawal_amount = 20 * ONE_NEAR;
+    let reserved_bytes = Contract::checked_reservation(&message);
+    contract.reserve_platform_storage(&platform, reserved_bytes);
+    context.predecessor_account_id(env::current_account_id());
+    testing_env!(
+        context.build(),
+        test_vm_config(),
+        RuntimeFeesConfig::test(),
+        HashMap::new(),
+        vec![PromiseResult::Failed]
+    );
+    assert_eq!(contract.on_rewrapped_for_refund(platform.clone(), U128(ONE_NEAR), message, reserved_bytes).0, 0);
+    let request = contract.load_request(&key);
+    assert_eq!(request.tranches.len(), 2);
+    assert_eq!(request.tranches[0].unlocked().unwrap().refund_near, 0);
+    assert_eq!(request.tranches[1].unlocked().unwrap().refund_near, ONE_NEAR);
+    assert_eq!(contract.data().total_pending_withdrawal_amount, 21 * ONE_NEAR);
+    assert_eq!(contract.data().refund_near_reserved, ONE_NEAR);
+    assert_eq!(contract.platform_user(&platform).storage_reserved_bytes, 0);
+    context.account_balance(NearToken::from_near(20));
+    testing_env!(context.build());
+    assert!(contract.available_near() < 20 * ONE_NEAR);
+    contract.withdraw_request(platform, key.request_key.into());
+    let request = contract.load_request(&key);
+    assert_eq!(request.tranches.len(), 2);
+    assert_eq!(request.tranches[0].unlocked().unwrap().amount, 20 * ONE_NEAR);
+    assert!(
+        matches!(&request.tranches[1], TrancheLock::Wrapping { tranche, amount_to_wrap } if tranche.refund_near == ONE_NEAR && *amount_to_wrap == ONE_NEAR)
+    );
+}
+
+#[test]
+fn wrapping_recovery_converts_refund_near_reserve_to_wnear_residual() {
+    let (mut contract, _context, platform) = setup();
+    let message = UnstakeMessage {
+        receiver_id: platform.clone(),
+        withdraw_tokens: WithdrawTokens::Wnear {
+            is_storage_deposit: false,
+            msg: "0".to_string(),
+            memo: None,
+            min_gas: None,
+        },
+    };
+    let key = PlatformRequestKey {
+        platform_id: platform.clone(),
+        request_key: Contract::request_key(&message),
+    };
+    contract.save_request(
+        &key,
+        Some(WithdrawalRequest {
+            message,
+            tranches: vec![TrancheLock::Wrapping {
+                tranche: WithdrawalTranche {
+                    amount: ONE_NEAR,
+                    available_epoch_height: 0,
+                    wnear_residual: 0,
+                    refund_near: ONE_NEAR,
+                },
+                amount_to_wrap: ONE_NEAR,
+            }],
+        }),
+    );
+    contract.data_mut().refund_near_reserved = ONE_NEAR;
+    contract.recover_wrapping(platform.clone(), key.request_key.into(), true, key.request_key.into());
+    let tranche = contract.load_request(&key).tranches[0].unlocked().unwrap().clone();
+    assert_eq!(tranche.refund_near, 0);
+    assert_eq!(tranche.wnear_residual, ONE_NEAR);
+    assert_eq!(contract.data().refund_near_reserved, 0);
 }
 
 #[test]

@@ -107,6 +107,7 @@ pub struct ContractData {
     platform_users: IterableMap<AccountId, PlatformUser>,
     withdrawal_requests: IterableMap<PlatformRequestKey, WithdrawalRequest>,
     total_pending_withdrawal_amount: u128,
+    refund_near_reserved: u128,
     total_platform_user_storage_deposits: u128,
     emergency_storage_reserve: u128,
     total_active_request_keys: u32,
@@ -181,6 +182,7 @@ impl Contract {
                 platform_users: IterableMap::new(StorageKey::PlatformUsers),
                 withdrawal_requests: IterableMap::new(StorageKey::WithdrawalRequests),
                 total_pending_withdrawal_amount: 0,
+                refund_near_reserved: 0,
                 total_platform_user_storage_deposits: 0,
                 emergency_storage_reserve: 0,
                 total_active_request_keys: 0,
@@ -227,6 +229,7 @@ impl Contract {
             .checked_add(CONTRACT_MIN_RESERVE_BALANCE.as_yoctonear())
             .and_then(|value| value.checked_add(self.data().total_platform_user_storage_deposits))
             .and_then(|value| value.checked_add(self.data().emergency_storage_reserve))
+            .and_then(|value| value.checked_add(self.data().refund_near_reserved))
             .expect("NEAR reserve overflow");
         env::account_balance()
             .as_yoctonear()

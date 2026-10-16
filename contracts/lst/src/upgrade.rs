@@ -28,6 +28,7 @@ impl Contract {
                 platform_users: IterableMap::new(StorageKey::PlatformUsers),
                 withdrawal_requests: IterableMap::new(StorageKey::WithdrawalRequests),
                 total_pending_withdrawal_amount: 0,
+                refund_near_reserved: 0,
                 total_platform_user_storage_deposits: 0,
                 emergency_storage_reserve: 0,
                 total_active_request_keys: 0,

@@ -25,8 +25,10 @@ Plan A follows the returning Promise chain and has no per-stake recovery record.
 Sandbox fault injection confirms that a post-unwrap callback panic or out-of-gas
 failure can leave a storage reservation pending and cause the outer wNEAR
 resolver to refund from wNEAR already held by this contract. A failed re-wrap
-does not use shared wNEAR for a refund, but leaves the unwrapped NEAR without a
-per-stake claim. These are known Plan A limitations, not covered by its normal
-failure handling. Do not deploy this integration without an independent security
-review and an explicit decision to accept these failure assumptions; use a
-pending-stake recovery design (Plan B) if they are unacceptable.
+does not use shared wNEAR for a refund: it queues an immediately withdrawable
+NEAR-backed claim under the supplied refund route. This still depends on its
+callback completing; callback panic or out-of-gas remains a known Plan A risk,
+not covered by its normal failure handling. Do not deploy this integration
+without an independent security review and an explicit decision to accept these
+failure assumptions; use a pending-stake recovery design (Plan B) if they are
+unacceptable.

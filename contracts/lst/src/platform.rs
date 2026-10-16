@@ -30,7 +30,8 @@ const GAS_WNEAR_WITHDRAW: Gas = Gas::from_tgas(10);
 // Must also schedule the platform receiver (at most 40 Tgas) and resolver (40 Tgas).
 const GAS_ON_WNEAR_UNWRAPPED: Gas = Gas::from_tgas(100);
 const GAS_WNEAR_DEPOSIT: Gas = Gas::from_tgas(10);
-const GAS_ON_REWRAPPED: Gas = Gas::from_tgas(10);
+// A failed re-wrap may persist an immediately withdrawable claim before the outer resolver runs.
+const GAS_ON_REWRAPPED: Gas = Gas::from_tgas(40);
 const GAS_STAKE_RESOLVER: Gas = Gas::from_tgas(40);
 const GAS_WNEAR_WRAP: Gas = Gas::from_tgas(10);
 // Schedules ft_transfer_call (at most 60 + 30 Tgas) and its 25 Tgas callback;
@@ -113,6 +114,8 @@ pub struct WithdrawalTranche {
     pub amount: u128,
     pub available_epoch_height: EpochHeight,
     pub wnear_residual: u128,
+    // Failed-stake refund still backed by reserved NEAR, not yet wrapped to wNEAR.
+    pub refund_near: u128,
 }
 
 #[near(serializers = [borsh])]
@@ -157,6 +160,7 @@ pub struct WithdrawalTrancheView {
     pub amount: U128,
     pub available_epoch_height: EpochHeight,
     pub wnear_residual: U128,
+    pub refund_near: U128,
     pub matured: bool,
     pub locked: bool,
 }
@@ -293,6 +297,56 @@ impl Contract {
         self.save_platform_user(&key.platform_id, user);
     }
 
+    fn enqueue_rewrap_refund(&mut self, platform_id: &AccountId, amount: u128, message: UnstakeMessage, reserved_bytes: u64) -> CryptoHash {
+        Self::validate_unstake_message(&message);
+        require!(reserved_bytes >= Self::checked_reservation(&message), "Missing refund storage reservation");
+        require!(
+            self.platform_user(platform_id).storage_reserved_bytes >= reserved_bytes,
+            "Missing platform storage reservation"
+        );
+        let request_key = Self::request_key(&message);
+        let key = PlatformRequestKey {
+            platform_id: platform_id.clone(),
+            request_key,
+        };
+        let mut request = self.data().withdrawal_requests.get(&key).cloned().unwrap_or(WithdrawalRequest {
+            message: message.clone(),
+            tranches: Vec::new(),
+        });
+        require!(request.message == message, "Withdrawal route mismatch");
+        let epoch = get_epoch_height();
+        if let Some(index) = request.tranches.iter().position(|lock| {
+            lock.unlocked()
+                .map(|tranche| tranche.available_epoch_height == epoch && tranche.refund_near == tranche.amount)
+                .unwrap_or(false)
+        }) {
+            if let TrancheLock::Unlocked(tranche) = &mut request.tranches[index] {
+                tranche.amount = tranche.amount.checked_add(amount).expect("Refund tranche overflow");
+                tranche.refund_near = tranche.refund_near.checked_add(amount).expect("Refund NEAR overflow");
+            }
+        } else {
+            require!(request.tranches.len() < MAX_TRANCHES_PER_REQUEST, "Withdrawal tranche limit");
+            request.tranches.push(TrancheLock::Unlocked(WithdrawalTranche {
+                amount,
+                available_epoch_height: epoch,
+                wnear_residual: 0,
+                refund_near: amount,
+            }));
+        }
+        let pending = self
+            .data()
+            .total_pending_withdrawal_amount
+            .checked_add(amount)
+            .expect("Pending withdrawal overflow");
+        let reserved = self.data().refund_near_reserved.checked_add(amount).expect("Refund NEAR reserve overflow");
+        self.data_mut().total_pending_withdrawal_amount = pending;
+        self.data_mut().refund_near_reserved = reserved;
+        self.save_request(&key, Some(request));
+        self.release_platform_storage(platform_id, reserved_bytes);
+        self.report_platform_overdraft(platform_id);
+        request_key
+    }
+
     fn report_platform_overdraft(&self, platform_id: &AccountId) {
         let amount = self.platform_user(platform_id).overdraft();
         if amount > 0 {
@@ -379,7 +433,7 @@ impl Contract {
         });
         let merge_index = request.tranches.iter().position(|lock| {
             lock.unlocked()
-                .map(|tranche| tranche.available_epoch_height == available_epoch_height)
+                .map(|tranche| tranche.available_epoch_height == available_epoch_height && tranche.refund_near == 0)
                 .unwrap_or(false)
         });
         if let Some(index) = merge_index {
@@ -400,6 +454,7 @@ impl Contract {
                 amount,
                 available_epoch_height,
                 wnear_residual: 0,
+                refund_near: 0,
             }));
         }
         let new_total_pending = self
@@ -555,6 +610,7 @@ impl Contract {
             _ => env::panic_str("Withdrawal has no send result"),
         };
         require!(consumed <= sent && consumed <= tranche.amount, "Invalid delivered amount");
+        require!(tranche.refund_near == 0, "Refund NEAR was not wrapped");
         let new_total = self
             .data()
             .total_pending_withdrawal_amount
@@ -589,6 +645,18 @@ impl Contract {
             .emit();
         }
     }
+
+    fn mark_refund_wrapped(&mut self, tranche: &mut WithdrawalTranche, amount_to_wrap: u128) {
+        require!(tranche.refund_near <= amount_to_wrap, "Refund NEAR exceeds wrap amount");
+        self.data_mut().refund_near_reserved = self
+            .data()
+            .refund_near_reserved
+            .checked_sub(tranche.refund_near)
+            .expect("Refund NEAR reserve underflow");
+        tranche.refund_near = 0;
+        tranche.wnear_residual = tranche.wnear_residual.checked_add(amount_to_wrap).expect("Wrapped residual overflow");
+        require!(tranche.wnear_residual <= tranche.amount, "Wrapped residual exceeds claim");
+    }
 }
 
 #[near]
@@ -609,28 +677,25 @@ impl FungibleTokenReceiver for Contract {
             }
             .emit();
             #[cfg(feature = "test")]
-            let callback_gas = if message.memo.as_deref() == Some("__callback_oog__") {
-                Gas::from_gas(1)
-            } else {
-                GAS_ON_WNEAR_UNWRAPPED
-            };
+            let inject_callback_oog = message.memo.as_deref() == Some("__callback_oog__");
+            #[cfg(feature = "test")]
+            let callback_gas = if inject_callback_oog { Gas::from_gas(1) } else { GAS_ON_WNEAR_UNWRAPPED };
             #[cfg(not(feature = "test"))]
             let callback_gas = GAS_ON_WNEAR_UNWRAPPED;
             #[cfg(feature = "test")]
-            if message.memo.as_deref() == Some("__callback_oog__") {
+            if inject_callback_oog {
                 Event::InjectedCallbackGas { gas: callback_gas.as_gas() }.emit();
             }
+            let callback = Self::ext(env::current_account_id()).with_static_gas(callback_gas);
+            #[cfg(feature = "test")]
+            // Keep the injected 1-gas callback from receiving the caller's unused gas.
+            let callback = if inject_callback_oog { callback.with_unused_gas_weight(0) } else { callback };
             ext_wnear::ext(self.configured_wnear_id())
                 .with_attached_deposit(NearToken::from_yoctonear(1))
                 .with_static_gas(GAS_WNEAR_WITHDRAW)
                 .with_unused_gas_weight(0)
                 .near_withdraw(amount)
-                .then(
-                    Self::ext(env::current_account_id())
-                        .with_static_gas(callback_gas)
-                        .with_unused_gas_weight(0)
-                        .on_wnear_unwrapped(sender_id, amount, message, reserved_bytes),
-                )
+                .then(callback.on_wnear_unwrapped(sender_id, amount, message, reserved_bytes))
                 .into()
         } else if predecessor == env::current_account_id() {
             let message: UnstakeMessage = serde_json::from_str(&msg).expect("Invalid unstake message");
@@ -657,14 +722,23 @@ impl Contract {
             request.tranches.iter().all(|lock| !lock.is_locked()),
             "Withdrawal request is already in progress"
         );
+        let epoch = get_epoch_height();
+        let has_matured_refund = request.tranches.iter().any(|lock| {
+            lock.unlocked()
+                .map(|tranche| tranche.available_epoch_height <= epoch && tranche.refund_near > 0)
+                .unwrap_or(false)
+        });
         let mut amount = 0u128;
         let mut residual = 0u128;
+        let mut refund_near = 0u128;
         let mut latest_epoch = 0u64;
         request.tranches.retain(|lock| {
             if let Some(tranche) = lock.unlocked() {
-                if tranche.available_epoch_height <= get_epoch_height() {
+                // Process refund claims separately so an illiquid ordinary tranche cannot block them.
+                if tranche.available_epoch_height <= epoch && (!has_matured_refund || tranche.refund_near > 0) {
                     amount = amount.checked_add(tranche.amount).expect("Withdrawal amount overflow");
                     residual = residual.checked_add(tranche.wnear_residual).expect("Residual overflow");
+                    refund_near = refund_near.checked_add(tranche.refund_near).expect("Refund NEAR overflow");
                     latest_epoch = latest_epoch.max(tranche.available_epoch_height);
                     return false;
                 }
@@ -673,6 +747,7 @@ impl Contract {
         });
         require!(amount > 0, "Withdrawal request has not matured");
         require!(residual <= amount, "Withdrawal residual exceeds claim");
+        require!(refund_near <= amount - residual, "Refund NEAR exceeds unwrapped claim");
         let WithdrawTokens::Wnear { min_gas, .. } = &request.message.withdraw_tokens;
         // Wrap path: 10 Tgas near_deposit + 135 Tgas on_near_deposit + 15 Tgas for this call.
         // Residual path: (receiver gas + 30) for ft_transfer_call + 25 for its callback + 10 for this call.
@@ -690,13 +765,17 @@ impl Contract {
             amount,
             available_epoch_height: latest_epoch,
             wnear_residual: residual,
+            refund_near,
         };
         let amount_to_wrap = amount - residual;
-        require!(self.available_near() >= amount_to_wrap, ERR_NO_ENOUGH_CONTRACT_BALANCE);
+        // This request may spend its own escrow, but not escrow belonging to other requests.
+        let available = self.available_near().checked_add(refund_near).expect("Available NEAR overflow");
+        require!(available >= amount_to_wrap, ERR_NO_ENOUGH_CONTRACT_BALANCE);
         let promise = if amount_to_wrap > 0 {
             request.tranches.push(TrancheLock::Wrapping { tranche, amount_to_wrap });
             self.save_request(&key, Some(request));
-            require!(self.available_near() >= amount_to_wrap, ERR_NO_ENOUGH_CONTRACT_BALANCE);
+            let available = self.available_near().checked_add(refund_near).expect("Available NEAR overflow");
+            require!(available >= amount_to_wrap, ERR_NO_ENOUGH_CONTRACT_BALANCE);
             ext_wnear::ext(wnear_id)
                 .with_attached_deposit(NearToken::from_yoctonear(amount_to_wrap))
                 .with_static_gas(GAS_WNEAR_WRAP)
@@ -741,8 +820,7 @@ impl Contract {
             _ => env::panic_str("Wrapping recovery stage mismatch"),
         };
         if wrapped {
-            tranche.wnear_residual = tranche.wnear_residual.checked_add(amount_to_wrap).expect("Wrapped residual overflow");
-            require!(tranche.wnear_residual <= tranche.amount, "Wrapped residual exceeds claim");
+            self.mark_refund_wrapped(&mut tranche, amount_to_wrap);
         }
         request.tranches[index] = TrancheLock::Unlocked(tranche);
         self.save_request(&key, Some(request));
@@ -806,7 +884,7 @@ impl Contract {
             .emit();
             return PromiseOrValue::Value(());
         }
-        tranche.wnear_residual = tranche.wnear_residual.checked_add(amount_to_wrap).expect("Wrapped residual overflow");
+        self.mark_refund_wrapped(&mut tranche, amount_to_wrap);
         require!(tranche.wnear_residual == tranche.amount, "Wrapped amount differs from claim");
         let amount_to_send = tranche.amount;
         request.tranches[index] = TrancheLock::WnearSending { tranche, amount_to_send };
@@ -873,7 +951,6 @@ impl Contract {
             || self.data().total_staked_near_amount.checked_add(amount.0).is_none()
             || self.data().epoch_requested_stake_amount.checked_add(amount.0).is_none()
         {
-            self.release_platform_storage(&platform_id, reserved_bytes);
             return ext_wnear::ext(self.configured_wnear_id())
                 .with_attached_deposit(NearToken::from_yoctonear(amount.0))
                 .with_static_gas(GAS_WNEAR_DEPOSIT)
@@ -883,7 +960,7 @@ impl Contract {
                     Self::ext(env::current_account_id())
                         .with_static_gas(GAS_ON_REWRAPPED)
                         .with_unused_gas_weight(0)
-                        .on_rewrapped_for_refund(platform_id, amount),
+                        .on_rewrapped_for_refund(platform_id, amount, message.refund_message, reserved_bytes),
                 )
                 .into();
         }
@@ -916,8 +993,9 @@ impl Contract {
     }
 
     #[private]
-    pub fn on_rewrapped_for_refund(&mut self, platform_id: AccountId, amount: U128) -> U128 {
+    pub fn on_rewrapped_for_refund(&mut self, platform_id: AccountId, amount: U128, refund_message: UnstakeMessage, reserved_bytes: u64) -> U128 {
         if matches!(env::promise_result(0), PromiseResult::Successful(_)) {
+            self.release_platform_storage(&platform_id, reserved_bytes);
             Event::StakeRewrappedForRefund {
                 platform_id: &platform_id,
                 amount,
@@ -925,8 +1003,15 @@ impl Contract {
             .emit();
             amount
         } else {
+            let request_key = self.enqueue_rewrap_refund(&platform_id, amount.0, refund_message, reserved_bytes);
             Event::StakeRewrapFailed {
                 platform_id: &platform_id,
+                amount,
+            }
+            .emit();
+            Event::StakeRefundQueued {
+                platform_id: &platform_id,
+                request_key: request_key.into(),
                 amount,
             }
             .emit();
@@ -1191,6 +1276,7 @@ impl Contract {
                             amount: tranche.amount.into(),
                             available_epoch_height: tranche.available_epoch_height,
                             wnear_residual: tranche.wnear_residual.into(),
+                            refund_near: tranche.refund_near.into(),
                             matured: tranche.available_epoch_height <= get_epoch_height(),
                             locked: lock.is_locked(),
                         }
@@ -1218,6 +1304,10 @@ impl Contract {
 
     pub fn get_total_pending_withdrawal_amount(&self) -> U128 {
         self.data().total_pending_withdrawal_amount.into()
+    }
+
+    pub fn get_refund_near_reserved(&self) -> U128 {
+        self.data().refund_near_reserved.into()
     }
 
     pub fn get_withdrawal_requests(&self, platform_id: AccountId, from_index: Option<usize>, limit: Option<usize>) -> Vec<WithdrawalRequestView> {
