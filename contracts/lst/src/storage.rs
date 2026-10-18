@@ -3,16 +3,10 @@ use crate::*;
 #[near]
 impl StorageManagement for Contract {
     #[payable]
-    fn storage_deposit(
-        &mut self,
-        account_id: Option<AccountId>,
-        registration_only: Option<bool>,
-    ) -> StorageBalance {
+    fn storage_deposit(&mut self, account_id: Option<AccountId>, registration_only: Option<bool>) -> StorageBalance {
         let acc_id = account_id.clone().unwrap_or(env::predecessor_account_id());
         if self.data().accounts.get(&acc_id).is_none() {
-            self.data_mut()
-                .accounts
-                .insert(acc_id.clone(), Account::default());
+            self.data_mut().accounts.insert(acc_id.clone(), Account::default());
         }
         self.data_mut().token.storage_deposit(account_id, registration_only)
     }
@@ -25,8 +19,12 @@ impl StorageManagement for Contract {
     /// force unregister is not allowed here,
     /// return true only if both account and token.account are empty.
     #[payable]
-     fn storage_unregister(&mut self, force: Option<bool>) -> bool {
+    fn storage_unregister(&mut self, force: Option<bool>) -> bool {
         require!(force.is_none() || force.unwrap() == false, ERR_FORCE_UNGREGISTER);
+        require!(
+            self.data().platform_users.get(&env::predecessor_account_id()).is_none(),
+            "Registered platform users cannot unregister FT storage"
+        );
         if let Some((account_id, balance)) = self.data_mut().token.internal_storage_unregister(None) {
             // still need to check account
             let account = self.data_mut().accounts.remove(&account_id).unwrap_or(Account::default());
