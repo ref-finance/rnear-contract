@@ -372,6 +372,29 @@ async fn plan_a_stake_unstake_and_permissionless_withdraw() {
     assert!(stake.is_success(), "{stake:?}");
     assert!(stake.logs().iter().any(|log| log.contains("\"memo\":\"stake\"")), "{stake:?}");
     assert!(
+        stake
+            .logs()
+            .iter()
+            .any(|log| log.contains("\"event\":\"stake_accepted\"") && log.contains("\"attempt_id\":0")),
+        "{stake:?}"
+    );
+    assert!(
+        stake
+            .logs()
+            .iter()
+            .any(|log| log.contains("\"event\":\"stake_completed\"") && log.contains("\"attempt_id\":0")),
+        "{stake:?}"
+    );
+    let lost: Option<lst::StakeLostFoundView> = lst
+        .call("get_stake_lostfound")
+        .args_json(json!({"attempt_id": 0}))
+        .view()
+        .await
+        .unwrap()
+        .json()
+        .unwrap();
+    assert!(lost.is_none());
+    assert!(
         stake.logs().iter().any(|log| log.contains("\"event\":\"platform_stake_delivered\"")),
         "{stake:?}"
     );
@@ -1017,7 +1040,7 @@ async fn plan_a_rejects_invalid_stakes_without_reserving_storage() {
 }
 
 #[tokio::test]
-async fn plan_a_failed_unwrap_refunds_input_and_releases_reservation() {
+async fn failed_unwrap_requires_owner_recovery_without_withdrawal_request() {
     let (_worker, root, lst, wnear, platform) = setup_fault_case().await;
     let amount = NearToken::from_near(1).as_yoctonear();
     wrap_wnear(&platform, &wnear, amount).await;
@@ -1034,11 +1057,11 @@ async fn plan_a_failed_unwrap_refunds_input_and_releases_reservation() {
     let outcome = stake_wnear(&platform, &wnear, &lst, amount, message.clone(), 150).await;
     assert!(outcome.is_success(), "{outcome:?}");
     assert!(
-        outcome.logs().iter().any(|log| log.contains("\"event\":\"stake_unwrap_failed\"")),
+        outcome.logs().iter().any(|log| log.contains("\"event\":\"stake_lost_found_detected\"")),
         "{outcome:?}"
     );
-    assert_eq!(token_balance(&wnear, platform.id()).await, amount);
-    assert_eq!(token_balance(&wnear, lst.id()).await, 0);
+    assert_eq!(token_balance(&wnear, platform.id()).await, 0);
+    assert_eq!(token_balance(&wnear, lst.id()).await, amount);
     assert_eq!(token_balance(&lst, platform.id()).await, 0);
     let status: lst::PlatformUserView = lst
         .call("get_platform_user")
@@ -1048,22 +1071,153 @@ async fn plan_a_failed_unwrap_refunds_input_and_releases_reservation() {
         .unwrap()
         .json()
         .unwrap();
-    assert_eq!(status.storage_reserved_bytes, 0);
-    assert_eq!(status.inflight_storage_operations, 0);
-
-    let restore = root
-        .call(wnear.id(), "set_fail_next_withdraw")
-        .args_json(json!({"fail": false}))
+    assert!(status.storage_reserved_bytes > 0);
+    assert_eq!(status.inflight_storage_operations, 1);
+    let lost: lst::StakeLostFoundView = lst
+        .call("get_stake_lostfound")
+        .args_json(json!({"attempt_id": 0}))
+        .view()
+        .await
+        .unwrap()
+        .json::<Option<_>>()
+        .unwrap()
+        .unwrap();
+    assert_eq!(lost.status, lst::StakeLostFoundStatus::Wnear);
+    assert_eq!(lost.refund_message.receiver_id, *platform.id());
+    let denied = platform
+        .as_account()
+        .call(lst.id(), "recover_stake_lostfound")
+        .args_json(json!({"attempt_id": 0, "asset": "Wnear", "evidence": outcome.outcome().transaction_hash.to_string()}))
+        .deposit(NearToken::from_yoctonear(1))
         .transact()
         .await
         .unwrap();
-    assert!(restore.is_success(), "{restore:?}");
-    let retry = stake_wnear(&platform, &wnear, &lst, amount, message, 150).await;
-    assert!(retry.is_success(), "{retry:?}");
-    assert!(
-        retry.logs().iter().any(|log| log.contains("\"event\":\"platform_stake_delivered\"")),
-        "{retry:?}"
-    );
+    assert!(denied.is_failure(), "{denied:?}");
+    let wrong_asset = root
+        .call(lst.id(), "recover_stake_lostfound")
+        .args_json(json!({"attempt_id": 0, "asset": "Near", "evidence": outcome.outcome().transaction_hash.to_string()}))
+        .deposit(NearToken::from_yoctonear(1))
+        .transact()
+        .await
+        .unwrap();
+    assert!(wrong_asset.is_failure(), "{wrong_asset:?}");
+    let key: Base58CryptoHash = lst
+        .call("get_request_key")
+        .args_json(json!({"args": message["refund_message"]}))
+        .view()
+        .await
+        .unwrap()
+        .json()
+        .unwrap();
+    let before = root
+        .call(lst.id(), "withdraw_request")
+        .args_json(json!({"platform_id": platform.id(), "request_key": key}))
+        .gas(Gas::from_tgas(200))
+        .transact()
+        .await
+        .unwrap();
+    assert!(before.is_failure(), "{before:?}");
+    let recovered = root
+        .call(lst.id(), "recover_stake_lostfound")
+        .args_json(json!({"attempt_id": 0, "asset": "Wnear", "evidence": outcome.outcome().transaction_hash.to_string()}))
+        .deposit(NearToken::from_yoctonear(1))
+        .gas(Gas::from_tgas(200))
+        .transact()
+        .await
+        .unwrap();
+    assert!(recovered.is_success(), "{recovered:?}");
+    assert!(lst
+        .call("get_stake_lostfound")
+        .args_json(json!({"attempt_id": 0}))
+        .view()
+        .await
+        .unwrap()
+        .json::<Option<lst::StakeLostFoundView>>()
+        .unwrap()
+        .is_none());
+    let repeat = root
+        .call(lst.id(), "recover_stake_lostfound")
+        .args_json(json!({"attempt_id": 0, "asset": "Wnear", "evidence": outcome.outcome().transaction_hash.to_string()}))
+        .deposit(NearToken::from_yoctonear(1))
+        .transact()
+        .await
+        .unwrap();
+    assert!(repeat.is_failure(), "{repeat:?}");
+    assert_eq!(token_balance(&wnear, platform.id()).await, amount);
+    assert_eq!(token_balance(&wnear, lst.id()).await, 0);
+    let request: Option<lst::WithdrawalRequestView> = lst
+        .call("get_withdrawal_request")
+        .args_json(json!({"platform_id": platform.id(), "request_key": key}))
+        .view()
+        .await
+        .unwrap()
+        .json()
+        .unwrap();
+    assert!(request.is_none());
+}
+
+#[tokio::test]
+async fn partial_direct_recovery_keeps_only_unused_wnear_retryable() {
+    let (_worker, root, lst, wnear, platform) = setup_fault_case().await;
+    let amount = NearToken::from_near(2).as_yoctonear();
+    wrap_wnear(&platform, &wnear, amount).await;
+    let fail = root
+        .call(wnear.id(), "set_fail_next_withdraw")
+        .args_json(json!({"fail": true}))
+        .transact()
+        .await
+        .unwrap();
+    assert!(fail.is_success(), "{fail:?}");
+    let refund_message = json!({"receiver_id": platform.id(), "withdraw_tokens": {"wnear": {"msg": "half_once"}}});
+    let message = json!({"receiver_id": platform.id(), "msg": "0", "refund_message": refund_message});
+    let accepted = stake_wnear(&platform, &wnear, &lst, amount, message, 150).await;
+    assert!(accepted.is_success(), "{accepted:?}");
+    let evidence = accepted.outcome().transaction_hash.to_string();
+    let first = root
+        .call(lst.id(), "recover_stake_lostfound")
+        .args_json(json!({"attempt_id": 0, "asset": "Wnear", "evidence": evidence}))
+        .deposit(NearToken::from_yoctonear(1))
+        .gas(Gas::from_tgas(200))
+        .transact()
+        .await
+        .unwrap();
+    assert!(first.is_success(), "{first:?}");
+    let remaining: lst::StakeLostFoundView = lst
+        .call("get_stake_lostfound")
+        .args_json(json!({"attempt_id": 0}))
+        .view()
+        .await
+        .unwrap()
+        .json::<Option<_>>()
+        .unwrap()
+        .unwrap();
+    assert_eq!(remaining.status, lst::StakeLostFoundStatus::Wnear);
+    assert_eq!(remaining.amount.0, amount / 2);
+    assert_eq!(token_balance(&wnear, platform.id()).await, amount / 2);
+    assert_eq!(token_balance(&wnear, lst.id()).await, amount / 2);
+
+    let second = root
+        .call(lst.id(), "recover_stake_lostfound")
+        .args_json(json!({"attempt_id": 0, "asset": "Wnear", "evidence": evidence}))
+        .deposit(NearToken::from_yoctonear(1))
+        .gas(Gas::from_tgas(200))
+        .transact()
+        .await
+        .unwrap();
+    assert!(second.is_success(), "{second:?}");
+    assert!(lst
+        .call("get_stake_lostfound")
+        .args_json(json!({"attempt_id": 0}))
+        .view()
+        .await
+        .unwrap()
+        .json::<Option<lst::StakeLostFoundView>>()
+        .unwrap()
+        .is_none());
+    assert_eq!(token_balance(&wnear, platform.id()).await, amount);
+    assert_eq!(token_balance(&wnear, lst.id()).await, 0);
+    let pending: U128 = lst.call("get_total_pending_withdrawal_amount").view().await.unwrap().json().unwrap();
+    assert_eq!(pending.0, 0);
 }
 
 #[tokio::test]
@@ -1376,7 +1530,7 @@ async fn plan_a_refund_at_tranche_limit_fits_150_tgas() {
 }
 
 #[tokio::test]
-async fn plan_a_rewrap_failure_does_not_refund_from_shared_wnear() {
+async fn unmintable_stake_keeps_shared_wnear_and_requires_near_recovery() {
     let (_worker, root, lst, wnear, platform) = setup_fault_case().await;
     seed_shared_wnear(&platform, &wnear, &lst).await;
     let shared = NearToken::from_near(10).as_yoctonear();
@@ -1386,41 +1540,31 @@ async fn plan_a_rewrap_failure_does_not_refund_from_shared_wnear() {
         "refund_message": {"receiver_id": platform.id(),
             "withdraw_tokens": {"wnear": {"msg": "0"}}}
     });
-    let success = platform
-        .as_account()
-        .call(wnear.id(), "ft_transfer_call")
-        .args_json(json!({"receiver_id": lst.id(), "amount": amount.to_string(),
-            "msg": message.to_string()}))
-        .deposit(NearToken::from_yoctonear(1))
-        .gas(Gas::from_tgas(150))
-        .transact()
-        .await
-        .unwrap();
-    assert!(success.is_success(), "{success:?}");
-    assert_eq!(token_balance(&wnear, platform.id()).await, shared);
-    assert_eq!(token_balance(&wnear, lst.id()).await, shared);
-
-    let fail_wrap = root
-        .call(wnear.id(), "set_fail_next_deposit")
-        .args_json(json!({"fail": true}))
-        .transact()
-        .await
-        .unwrap();
-    assert!(fail_wrap.is_success(), "{fail_wrap:?}");
-    let failed = platform
-        .as_account()
-        .call(wnear.id(), "ft_transfer_call")
-        .args_json(json!({"receiver_id": lst.id(), "amount": amount.to_string(),
-            "msg": message.to_string()}))
-        .deposit(NearToken::from_yoctonear(1))
-        .gas(Gas::from_tgas(150))
-        .transact()
-        .await
-        .unwrap();
+    let failed = stake_wnear(&platform, &wnear, &lst, amount, message, 150).await;
     assert!(failed.is_success(), "{failed:?}");
-    assert!(failed.logs().iter().any(|log| log.contains("\"event\":\"stake_rewrap_failed\"")));
-    assert_eq!(token_balance(&wnear, platform.id()).await, amount);
+    assert!(failed.logs().iter().any(|log| log.contains("\"event\":\"stake_lost_found_detected\"")));
+    assert_eq!(token_balance(&wnear, platform.id()).await, shared - amount);
     assert_eq!(token_balance(&wnear, lst.id()).await, shared);
+    let lost: lst::StakeLostFoundView = lst
+        .call("get_stake_lostfound")
+        .args_json(json!({"attempt_id": 0}))
+        .view()
+        .await
+        .unwrap()
+        .json::<Option<_>>()
+        .unwrap()
+        .unwrap();
+    assert_eq!(lost.status, lst::StakeLostFoundStatus::Near);
+    let denied = root
+        .call(lst.id(), "recover_stake_lostfound")
+        .args_json(json!({"attempt_id": 0, "asset": "Wnear", "evidence": failed.outcome().transaction_hash.to_string()}))
+        .deposit(NearToken::from_yoctonear(1))
+        .transact()
+        .await
+        .unwrap();
+    assert!(denied.is_failure(), "{denied:?}");
+    let reserved: U128 = lst.call("get_stake_lostfound_near_reserved").view().await.unwrap().json().unwrap();
+    assert_eq!(reserved.0, amount);
     let status: lst::PlatformUserView = lst
         .call("get_platform_user")
         .args_json(json!({"platform_id": platform.id()}))
@@ -1429,12 +1573,12 @@ async fn plan_a_rewrap_failure_does_not_refund_from_shared_wnear() {
         .unwrap()
         .json()
         .unwrap();
-    assert_eq!(status.storage_reserved_bytes, 0);
-    assert_eq!(status.inflight_storage_operations, 0);
+    assert!(status.storage_reserved_bytes > 0);
+    assert_eq!(status.inflight_storage_operations, 1);
 }
 
 #[tokio::test]
-async fn rewrap_failure_queues_immediate_refund_and_withdraws_reserved_near() {
+async fn owner_retries_direct_near_recovery_after_failed_wrap() {
     let (_worker, root, lst, wnear, platform) = setup_fault_case().await;
     seed_shared_wnear(&platform, &wnear, &lst).await;
     let shared = NearToken::from_near(10).as_yoctonear();
@@ -1449,6 +1593,9 @@ async fn rewrap_failure_queues_immediate_refund_and_withdraws_reserved_near() {
         .json()
         .unwrap();
     let message = json!({"receiver_id": platform.id(), "msg": "0", "memo": "__force_rewrap__", "refund_message": route});
+    let failed = stake_wnear(&platform, &wnear, &lst, amount, message, 150).await;
+    assert!(failed.is_success(), "{failed:?}");
+    let evidence = failed.outcome().transaction_hash.to_string();
     let fail_wrap = root
         .call(wnear.id(), "set_fail_next_deposit")
         .args_json(json!({"fail": true}))
@@ -1456,36 +1603,29 @@ async fn rewrap_failure_queues_immediate_refund_and_withdraws_reserved_near() {
         .await
         .unwrap();
     assert!(fail_wrap.is_success(), "{fail_wrap:?}");
-    let failed = stake_wnear(&platform, &wnear, &lst, amount, message, 150).await;
-    assert!(failed.is_success(), "{failed:?}");
-    assert!(failed.logs().iter().any(|log| log.contains("\"event\":\"stake_refund_queued\"")));
-    assert_eq!(token_balance(&wnear, lst.id()).await, shared);
-    let request: lst::WithdrawalRequestView = lst
-        .call("get_withdrawal_request")
-        .args_json(json!({"platform_id": platform.id(), "request_key": key}))
+    let first = root
+        .call(lst.id(), "recover_stake_lostfound")
+        .args_json(json!({"attempt_id": 0, "asset": "Near", "evidence": evidence}))
+        .deposit(NearToken::from_yoctonear(1))
+        .gas(Gas::from_tgas(220))
+        .transact()
+        .await
+        .unwrap();
+    assert!(first.is_success(), "{first:?}");
+    assert!(first.logs().iter().any(|log| log.contains("\"event\":\"stake_recovery_failed\"")));
+    let lost: lst::StakeLostFoundView = lst
+        .call("get_stake_lostfound")
+        .args_json(json!({"attempt_id": 0}))
         .view()
         .await
         .unwrap()
         .json::<Option<_>>()
         .unwrap()
         .unwrap();
-    assert_eq!(request.tranches.len(), 1);
-    assert_eq!(request.tranches[0].amount.0, amount);
-    assert_eq!(request.tranches[0].refund_near.0, amount);
-    assert_eq!(request.tranches[0].wnear_residual.0, 0);
-    assert!(request.tranches[0].matured);
-    let reserved: U128 = lst.call("get_refund_near_reserved").view().await.unwrap().json().unwrap();
+    assert_eq!(lost.status, lst::StakeLostFoundStatus::Near);
+    let reserved: U128 = lst.call("get_stake_lostfound_near_reserved").view().await.unwrap().json().unwrap();
     assert_eq!(reserved.0, amount);
-
-    let failed_withdrawal = root
-        .call(lst.id(), "withdraw_request")
-        .args_json(json!({"platform_id": platform.id(), "request_key": key}))
-        .gas(Gas::from_tgas(200))
-        .transact()
-        .await
-        .unwrap();
-    assert!(failed_withdrawal.is_success(), "{failed_withdrawal:?}");
-    let request: Option<lst::WithdrawalRequestView> = lst
+    let absent: Option<lst::WithdrawalRequestView> = lst
         .call("get_withdrawal_request")
         .args_json(json!({"platform_id": platform.id(), "request_key": key}))
         .view()
@@ -1493,9 +1633,7 @@ async fn rewrap_failure_queues_immediate_refund_and_withdraws_reserved_near() {
         .unwrap()
         .json()
         .unwrap();
-    assert!(request.unwrap().tranches.iter().any(|tranche| !tranche.locked && tranche.refund_near.0 == amount));
-    let reserved: U128 = lst.call("get_refund_near_reserved").view().await.unwrap().json().unwrap();
-    assert_eq!(reserved.0, amount);
+    assert!(absent.is_none());
 
     let restore = root
         .call(wnear.id(), "set_fail_next_deposit")
@@ -1504,28 +1642,38 @@ async fn rewrap_failure_queues_immediate_refund_and_withdraws_reserved_near() {
         .await
         .unwrap();
     assert!(restore.is_success(), "{restore:?}");
-    let withdrawn = root
-        .call(lst.id(), "withdraw_request")
-        .args_json(json!({"platform_id": platform.id(), "request_key": key}))
-        .gas(Gas::from_tgas(200))
+    let recovered = root
+        .call(lst.id(), "recover_stake_lostfound")
+        .args_json(json!({"attempt_id": 0, "asset": "Near", "evidence": evidence}))
+        .deposit(NearToken::from_yoctonear(1))
+        .gas(Gas::from_tgas(220))
         .transact()
         .await
         .unwrap();
-    assert!(withdrawn.is_success(), "{withdrawn:?}");
+    assert!(recovered.is_success(), "{recovered:?}");
+    assert!(lst
+        .call("get_stake_lostfound")
+        .args_json(json!({"attempt_id": 0}))
+        .view()
+        .await
+        .unwrap()
+        .json::<Option<lst::StakeLostFoundView>>()
+        .unwrap()
+        .is_none());
+    assert_eq!(token_balance(&wnear, platform.id()).await, shared);
     assert_eq!(token_balance(&wnear, lst.id()).await, shared);
-    let reserved: U128 = lst.call("get_refund_near_reserved").view().await.unwrap().json().unwrap();
+    let reserved: U128 = lst.call("get_stake_lostfound_near_reserved").view().await.unwrap().json().unwrap();
     assert_eq!(reserved.0, 0);
-    let pending: U128 = lst.call("get_total_pending_withdrawal_amount").view().await.unwrap().json().unwrap();
-    assert_eq!(pending.0, 0);
 }
 
 #[tokio::test]
-async fn plan_a_callback_failure_exposes_shared_balance_risk() {
-    let (_worker, _root, lst, wnear, platform) = setup_fault_case().await;
+async fn callback_failure_keeps_lostfound_without_refunding_shared_wnear() {
+    let (_worker, root, lst, wnear, platform) = setup_fault_case().await;
     seed_shared_wnear(&platform, &wnear, &lst).await;
     let shared = NearToken::from_near(10).as_yoctonear();
     let amount = NearToken::from_near(5).as_yoctonear();
-    for (memo, expected_inflight) in [("__panic_after_unwrap__", 1), ("__callback_oog__", 2)] {
+    let mut evidence = Vec::new();
+    for (attempt_id, memo) in [(0, "__panic_after_unwrap__"), (1, "__callback_oog__")] {
         let message = json!({
             "receiver_id": platform.id(), "msg": "0", "memo": memo,
             "refund_message": {"receiver_id": platform.id(),
@@ -1542,6 +1690,7 @@ async fn plan_a_callback_failure_exposes_shared_balance_risk() {
             .await
             .unwrap();
         assert!(outcome.is_success(), "{outcome:?}");
+        evidence.push(outcome.outcome().transaction_hash.to_string());
         if memo == "__callback_oog__" {
             assert!(
                 outcome
@@ -1551,8 +1700,8 @@ async fn plan_a_callback_failure_exposes_shared_balance_risk() {
                 "{outcome:?}"
             );
         }
-        assert_eq!(token_balance(&wnear, platform.id()).await, shared);
-        assert_eq!(token_balance(&wnear, lst.id()).await, shared - amount * expected_inflight as u128);
+        assert_eq!(token_balance(&wnear, platform.id()).await, shared - amount * (attempt_id as u128 + 1));
+        assert_eq!(token_balance(&wnear, lst.id()).await, shared);
         let status: lst::PlatformUserView = lst
             .call("get_platform_user")
             .args_json(json!({"platform_id": platform.id()}))
@@ -1561,10 +1710,47 @@ async fn plan_a_callback_failure_exposes_shared_balance_risk() {
             .unwrap()
             .json()
             .unwrap();
-        assert_eq!(status.inflight_storage_operations, expected_inflight);
+        assert_eq!(status.inflight_storage_operations, attempt_id + 1);
         assert!(status.storage_reserved_bytes > 0);
+        let lost: lst::StakeLostFoundView = lst
+            .call("get_stake_lostfound")
+            .args_json(json!({"attempt_id": attempt_id}))
+            .view()
+            .await
+            .unwrap()
+            .json::<Option<_>>()
+            .unwrap()
+            .unwrap();
+        assert_eq!(lost.status, lst::StakeLostFoundStatus::Processing);
     }
-    assert_eq!(token_balance(&wnear, lst.id()).await, 0);
+    let reserved: U128 = lst.call("get_stake_lostfound_near_reserved").view().await.unwrap().json().unwrap();
+    assert_eq!(reserved.0, 2 * amount);
+    for attempt_id in [0, 1] {
+        let recovered = root
+            .call(lst.id(), "recover_stake_lostfound")
+            .args_json(json!({"attempt_id": attempt_id, "asset": "Near", "evidence": evidence[attempt_id as usize]}))
+            .deposit(NearToken::from_yoctonear(1))
+            .gas(Gas::from_tgas(220))
+            .transact()
+            .await
+            .unwrap();
+        assert!(recovered.is_success(), "{recovered:?}");
+        assert!(lst
+            .call("get_stake_lostfound")
+            .args_json(json!({"attempt_id": attempt_id}))
+            .view()
+            .await
+            .unwrap()
+            .json::<Option<lst::StakeLostFoundView>>()
+            .unwrap()
+            .is_none());
+    }
+    let reserved: U128 = lst.call("get_stake_lostfound_near_reserved").view().await.unwrap().json().unwrap();
+    assert_eq!(reserved.0, 0);
+    let pending: U128 = lst.call("get_total_pending_withdrawal_amount").view().await.unwrap().json().unwrap();
+    assert_eq!(pending.0, 0);
+    assert_eq!(token_balance(&wnear, lst.id()).await, shared);
+    assert_eq!(token_balance(&wnear, platform.id()).await, shared);
 }
 
 #[tokio::test]

@@ -29,11 +29,11 @@ const MIN_EMERGENCY_STORAGE_RESERVE: u128 = 5 * ONE_NEAR;
 const GAS_WNEAR_WITHDRAW: Gas = Gas::from_tgas(10);
 // Must also schedule the platform receiver (at most 40 Tgas) and resolver (40 Tgas).
 const GAS_ON_WNEAR_UNWRAPPED: Gas = Gas::from_tgas(100);
-const GAS_WNEAR_DEPOSIT: Gas = Gas::from_tgas(10);
-// A failed re-wrap may persist an immediately withdrawable claim before the outer resolver runs.
-const GAS_ON_REWRAPPED: Gas = Gas::from_tgas(40);
 const GAS_STAKE_RESOLVER: Gas = Gas::from_tgas(40);
 const GAS_WNEAR_WRAP: Gas = Gas::from_tgas(10);
+// The recovery wrap callback must schedule ft_transfer_call (at most 60 + 30 Tgas) and its 25 Tgas resolver.
+const GAS_ON_STAKE_RECOVERY_WRAP: Gas = Gas::from_tgas(135);
+const GAS_ON_STAKE_RECOVERY_TRANSFER: Gas = Gas::from_tgas(25);
 // Schedules ft_transfer_call (at most 60 + 30 Tgas) and its 25 Tgas callback;
 // the remaining 20 Tgas is for this callback's own work.
 const GAS_ON_NEAR_DEPOSIT: Gas = Gas::from_tgas(135);
@@ -108,14 +108,50 @@ pub struct WithdrawalRequest {
     pub tranches: Vec<TrancheLock>,
 }
 
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StakeRecoveryAsset {
+    Near,
+    Wnear,
+}
+
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StakeLostFoundStatus {
+    Processing,
+    Near,
+    Wnear,
+    Wrapping,
+    Sending,
+}
+
+#[near(serializers = [borsh])]
+#[derive(Clone)]
+pub struct StakeLostFound {
+    pub platform_id: AccountId,
+    pub amount: u128,
+    pub refund_message: UnstakeMessage,
+    pub reserved_bytes: u64,
+    pub created_block_height: u64,
+    pub status: StakeLostFoundStatus,
+}
+
+#[near(serializers = [json])]
+pub struct StakeLostFoundView {
+    pub attempt_id: u64,
+    pub platform_id: AccountId,
+    pub amount: U128,
+    pub refund_message: UnstakeMessage,
+    pub created_block_height: u64,
+    pub status: StakeLostFoundStatus,
+}
+
 #[near(serializers = [borsh])]
 #[derive(Clone)]
 pub struct WithdrawalTranche {
     pub amount: u128,
     pub available_epoch_height: EpochHeight,
     pub wnear_residual: u128,
-    // Failed-stake refund still backed by reserved NEAR, not yet wrapped to wNEAR.
-    pub refund_near: u128,
 }
 
 #[near(serializers = [borsh])]
@@ -160,7 +196,6 @@ pub struct WithdrawalTrancheView {
     pub amount: U128,
     pub available_epoch_height: EpochHeight,
     pub wnear_residual: U128,
-    pub refund_near: U128,
     pub matured: bool,
     pub locked: bool,
 }
@@ -297,54 +332,74 @@ impl Contract {
         self.save_platform_user(&key.platform_id, user);
     }
 
-    fn enqueue_rewrap_refund(&mut self, platform_id: &AccountId, amount: u128, message: UnstakeMessage, reserved_bytes: u64) -> CryptoHash {
-        Self::validate_unstake_message(&message);
-        require!(reserved_bytes >= Self::checked_reservation(&message), "Missing refund storage reservation");
-        require!(
-            self.platform_user(platform_id).storage_reserved_bytes >= reserved_bytes,
-            "Missing platform storage reservation"
-        );
-        let request_key = Self::request_key(&message);
-        let key = PlatformRequestKey {
-            platform_id: platform_id.clone(),
-            request_key,
-        };
-        let mut request = self.data().withdrawal_requests.get(&key).cloned().unwrap_or(WithdrawalRequest {
-            message: message.clone(),
-            tranches: Vec::new(),
-        });
-        require!(request.message == message, "Withdrawal route mismatch");
-        let epoch = get_epoch_height();
-        if let Some(index) = request.tranches.iter().position(|lock| {
-            lock.unlocked()
-                .map(|tranche| tranche.available_epoch_height == epoch && tranche.refund_near == tranche.amount)
-                .unwrap_or(false)
-        }) {
-            if let TrancheLock::Unlocked(tranche) = &mut request.tranches[index] {
-                tranche.amount = tranche.amount.checked_add(amount).expect("Refund tranche overflow");
-                tranche.refund_near = tranche.refund_near.checked_add(amount).expect("Refund NEAR overflow");
-            }
+    pub(crate) fn save_stake_lostfound(&mut self, attempt_id: u64, entry: Option<StakeLostFound>, platform_id: &AccountId) {
+        let before = env::storage_usage();
+        if let Some(entry) = entry {
+            self.data_mut().stake_lostfound.insert(attempt_id, entry);
         } else {
-            require!(request.tranches.len() < MAX_TRANCHES_PER_REQUEST, "Withdrawal tranche limit");
-            request.tranches.push(TrancheLock::Unlocked(WithdrawalTranche {
-                amount,
-                available_epoch_height: epoch,
-                wnear_residual: 0,
-                refund_near: amount,
-            }));
+            self.data_mut().stake_lostfound.remove(&attempt_id);
         }
-        let pending = self
-            .data()
-            .total_pending_withdrawal_amount
-            .checked_add(amount)
-            .expect("Pending withdrawal overflow");
-        let reserved = self.data().refund_near_reserved.checked_add(amount).expect("Refund NEAR reserve overflow");
-        self.data_mut().total_pending_withdrawal_amount = pending;
-        self.data_mut().refund_near_reserved = reserved;
-        self.save_request(&key, Some(request));
-        self.release_platform_storage(platform_id, reserved_bytes);
-        self.report_platform_overdraft(platform_id);
-        request_key
+        self.data_mut().stake_lostfound.flush();
+        let after = env::storage_usage();
+        let mut user = self.platform_user(platform_id);
+        if after >= before {
+            user.storage_used_bytes = user.storage_used_bytes.checked_add(after - before).expect("Storage usage overflow");
+        } else {
+            user.storage_used_bytes = user.storage_used_bytes.checked_sub(before - after).expect("Storage usage underflow");
+        }
+        self.save_platform_user(platform_id, user);
+    }
+
+    fn remove_stake_lostfound(&mut self, attempt_id: u64, entry: &StakeLostFound) {
+        self.save_stake_lostfound(attempt_id, None, &entry.platform_id);
+        if matches!(
+            entry.status,
+            StakeLostFoundStatus::Processing | StakeLostFoundStatus::Near | StakeLostFoundStatus::Wrapping
+        ) {
+            self.data_mut().stake_lostfound_near_reserved = self
+                .data()
+                .stake_lostfound_near_reserved
+                .checked_sub(entry.amount)
+                .expect("Lost-found NEAR reserve underflow");
+        }
+    }
+
+    fn send_stake_recovery_wnear(&self, attempt_id: u64, entry: &StakeLostFound) -> Promise {
+        let WithdrawTokens::Wnear { msg, memo, min_gas, .. } = &entry.refund_message.withdraw_tokens;
+        let receiver_gas = min_gas.unwrap_or(Gas::from_tgas(35));
+        ext_wnear::ext(self.configured_wnear_id())
+            .with_attached_deposit(NearToken::from_yoctonear(1))
+            .with_static_gas(receiver_gas.checked_add(Gas::from_tgas(30)).expect("Gas overflow"))
+            .with_unused_gas_weight(0)
+            .ft_transfer_call(entry.refund_message.receiver_id.clone(), U128(entry.amount), memo.clone(), msg.clone())
+            .then(
+                Self::ext(env::current_account_id())
+                    .with_static_gas(GAS_ON_STAKE_RECOVERY_TRANSFER)
+                    .with_unused_gas_weight(0)
+                    .on_stake_recovery_transfer(attempt_id),
+            )
+    }
+
+    fn settle_stake_recovery_transfer(&mut self, attempt_id: u64, consumed: u128) {
+        let mut entry = self.data().stake_lostfound.get(&attempt_id).cloned().expect("Stake attempt does not exist");
+        require!(entry.status == StakeLostFoundStatus::Sending, "Stake recovery is not sending");
+        require!(consumed <= entry.amount, "Recovered amount exceeds send amount");
+        let remaining = entry.amount - consumed;
+        if remaining == 0 {
+            self.remove_stake_lostfound(attempt_id, &entry);
+            self.release_platform_storage(&entry.platform_id, entry.reserved_bytes);
+        } else {
+            entry.amount = remaining;
+            entry.status = StakeLostFoundStatus::Wnear;
+            self.save_stake_lostfound(attempt_id, Some(entry.clone()), &entry.platform_id);
+        }
+        Event::StakeRecoveryDelivered {
+            attempt_id,
+            platform_id: &entry.platform_id,
+            consumed: U128(consumed),
+            remaining: U128(remaining),
+        }
+        .emit();
     }
 
     fn report_platform_overdraft(&self, platform_id: &AccountId) {
@@ -433,7 +488,7 @@ impl Contract {
         });
         let merge_index = request.tranches.iter().position(|lock| {
             lock.unlocked()
-                .map(|tranche| tranche.available_epoch_height == available_epoch_height && tranche.refund_near == 0)
+                .map(|tranche| tranche.available_epoch_height == available_epoch_height)
                 .unwrap_or(false)
         });
         if let Some(index) = merge_index {
@@ -454,7 +509,6 @@ impl Contract {
                 amount,
                 available_epoch_height,
                 wnear_residual: 0,
-                refund_near: 0,
             }));
         }
         let new_total_pending = self
@@ -610,7 +664,6 @@ impl Contract {
             _ => env::panic_str("Withdrawal has no send result"),
         };
         require!(consumed <= sent && consumed <= tranche.amount, "Invalid delivered amount");
-        require!(tranche.refund_near == 0, "Refund NEAR was not wrapped");
         let new_total = self
             .data()
             .total_pending_withdrawal_amount
@@ -645,18 +698,6 @@ impl Contract {
             .emit();
         }
     }
-
-    fn mark_refund_wrapped(&mut self, tranche: &mut WithdrawalTranche, amount_to_wrap: u128) {
-        require!(tranche.refund_near <= amount_to_wrap, "Refund NEAR exceeds wrap amount");
-        self.data_mut().refund_near_reserved = self
-            .data()
-            .refund_near_reserved
-            .checked_sub(tranche.refund_near)
-            .expect("Refund NEAR reserve underflow");
-        tranche.refund_near = 0;
-        tranche.wnear_residual = tranche.wnear_residual.checked_add(amount_to_wrap).expect("Wrapped residual overflow");
-        require!(tranche.wnear_residual <= tranche.amount, "Wrapped residual exceeds claim");
-    }
 }
 
 #[near]
@@ -669,7 +710,29 @@ impl FungibleTokenReceiver for Contract {
             let message: StakeMessage = serde_json::from_str(&msg).expect("Invalid stake message");
             let reserved_bytes = self.validate_stake_message(&sender_id, amount.0, &message);
             self.reserve_platform_storage(&sender_id, reserved_bytes);
+            let attempt_id = self.data().next_stake_attempt_id;
+            self.data_mut().next_stake_attempt_id = attempt_id.checked_add(1).expect("Stake attempt ID overflow");
+            let entry = StakeLostFound {
+                platform_id: sender_id.clone(),
+                amount: amount.0,
+                refund_message: message.refund_message.clone(),
+                reserved_bytes,
+                created_block_height: env::block_height(),
+                status: StakeLostFoundStatus::Processing,
+            };
+            self.save_stake_lostfound(attempt_id, Some(entry), &sender_id);
+            let user = self.platform_user(&sender_id);
+            require!(
+                user.required_storage_balance() <= user.storage_deposit_total,
+                "Insufficient platform storage credit"
+            );
+            self.data_mut().stake_lostfound_near_reserved = self
+                .data()
+                .stake_lostfound_near_reserved
+                .checked_add(amount.0)
+                .expect("Lost-found NEAR reserve overflow");
             Event::StakeAccepted {
+                attempt_id,
                 platform_id: &sender_id,
                 receiver_id: &message.receiver_id,
                 deposit_amount: amount,
@@ -695,8 +758,9 @@ impl FungibleTokenReceiver for Contract {
                 .with_static_gas(GAS_WNEAR_WITHDRAW)
                 .with_unused_gas_weight(0)
                 .near_withdraw(amount)
-                .then(callback.on_wnear_unwrapped(sender_id, amount, message, reserved_bytes))
-                .into()
+                .then(callback.on_wnear_unwrapped(attempt_id, message));
+            // Once accepted, the outer wNEAR resolver must not refund from this contract's shared balance.
+            PromiseOrValue::Value(U128(0))
         } else if predecessor == env::current_account_id() {
             let message: UnstakeMessage = serde_json::from_str(&msg).expect("Invalid unstake message");
             self.internal_unstake_shares_to_request(&sender_id, amount.0, &message, None);
@@ -709,6 +773,107 @@ impl FungibleTokenReceiver for Contract {
 
 #[near]
 impl Contract {
+    #[payable]
+    pub fn recover_stake_lostfound(&mut self, attempt_id: u64, asset: StakeRecoveryAsset, evidence: Base58CryptoHash) -> Promise {
+        self.assert_owner();
+        assert_one_yocto();
+        let mut entry = self.data().stake_lostfound.get(&attempt_id).cloned().expect("Stake attempt does not exist");
+        require!(
+            match entry.status {
+                StakeLostFoundStatus::Processing => true,
+                StakeLostFoundStatus::Near => asset == StakeRecoveryAsset::Near,
+                StakeLostFoundStatus::Wnear => asset == StakeRecoveryAsset::Wnear,
+                StakeLostFoundStatus::Wrapping | StakeLostFoundStatus::Sending => false,
+            },
+            "Recovery stage is locked or asset contradicts the observed result"
+        );
+        // For Processing, the owner must verify that every receipt has finished and the asset is still held here.
+        require!(
+            env::prepaid_gas().as_gas() >= Gas::from_tgas(if asset == StakeRecoveryAsset::Near { 170 } else { 130 }).as_gas(),
+            "Insufficient gas for stake recovery"
+        );
+        let promise = match asset {
+            StakeRecoveryAsset::Near => {
+                entry.status = StakeLostFoundStatus::Wrapping;
+                self.save_stake_lostfound(attempt_id, Some(entry.clone()), &entry.platform_id);
+                ext_wnear::ext(self.configured_wnear_id())
+                    .with_attached_deposit(NearToken::from_yoctonear(entry.amount))
+                    .with_static_gas(GAS_WNEAR_WRAP)
+                    .with_unused_gas_weight(0)
+                    .near_deposit()
+                    .then(
+                        Self::ext(env::current_account_id())
+                            .with_static_gas(GAS_ON_STAKE_RECOVERY_WRAP)
+                            .with_unused_gas_weight(0)
+                            .on_stake_recovery_wrapped(attempt_id),
+                    )
+            }
+            StakeRecoveryAsset::Wnear => {
+                if entry.status == StakeLostFoundStatus::Processing {
+                    self.data_mut().stake_lostfound_near_reserved = self
+                        .data()
+                        .stake_lostfound_near_reserved
+                        .checked_sub(entry.amount)
+                        .expect("Lost-found NEAR reserve underflow");
+                }
+                entry.status = StakeLostFoundStatus::Sending;
+                self.save_stake_lostfound(attempt_id, Some(entry.clone()), &entry.platform_id);
+                self.send_stake_recovery_wnear(attempt_id, &entry)
+            }
+        };
+        Event::StakeRecoveryAttempt {
+            attempt_id,
+            platform_id: &entry.platform_id,
+            amount: U128(entry.amount),
+            asset,
+            evidence,
+        }
+        .emit();
+        promise
+    }
+
+    #[payable]
+    pub fn reconcile_stake_wrapping(&mut self, attempt_id: u64, wrapped: bool, evidence: Base58CryptoHash) {
+        self.assert_owner();
+        assert_one_yocto();
+        let mut entry = self.data().stake_lostfound.get(&attempt_id).cloned().expect("Stake attempt does not exist");
+        require!(entry.status == StakeLostFoundStatus::Wrapping, "Stake recovery is not wrapping");
+        entry.status = if wrapped { StakeLostFoundStatus::Wnear } else { StakeLostFoundStatus::Near };
+        if wrapped {
+            self.data_mut().stake_lostfound_near_reserved = self
+                .data()
+                .stake_lostfound_near_reserved
+                .checked_sub(entry.amount)
+                .expect("Lost-found NEAR reserve underflow");
+        }
+        self.save_stake_lostfound(attempt_id, Some(entry.clone()), &entry.platform_id);
+        Event::StakeRecoveryReconciled {
+            attempt_id,
+            platform_id: &entry.platform_id,
+            asset: Some(if wrapped { StakeRecoveryAsset::Wnear } else { StakeRecoveryAsset::Near }),
+            consumed: None,
+            evidence,
+        }
+        .emit();
+    }
+
+    #[payable]
+    pub fn reconcile_stake_transfer(&mut self, attempt_id: u64, consumed: U128, evidence: Base58CryptoHash) {
+        self.assert_owner();
+        assert_one_yocto();
+        let entry = self.data().stake_lostfound.get(&attempt_id).cloned().expect("Stake attempt does not exist");
+        require!(entry.status == StakeLostFoundStatus::Sending, "Stake recovery is not sending");
+        self.settle_stake_recovery_transfer(attempt_id, consumed.0);
+        Event::StakeRecoveryReconciled {
+            attempt_id,
+            platform_id: &entry.platform_id,
+            asset: None,
+            consumed: Some(consumed),
+            evidence,
+        }
+        .emit();
+    }
+
     pub fn withdraw_request(&mut self, platform_id: AccountId, request_key: Base58CryptoHash) -> Promise {
         let wnear_id = self.configured_wnear_id();
         let key = PlatformRequestKey {
@@ -723,22 +888,14 @@ impl Contract {
             "Withdrawal request is already in progress"
         );
         let epoch = get_epoch_height();
-        let has_matured_refund = request.tranches.iter().any(|lock| {
-            lock.unlocked()
-                .map(|tranche| tranche.available_epoch_height <= epoch && tranche.refund_near > 0)
-                .unwrap_or(false)
-        });
         let mut amount = 0u128;
         let mut residual = 0u128;
-        let mut refund_near = 0u128;
         let mut latest_epoch = 0u64;
         request.tranches.retain(|lock| {
             if let Some(tranche) = lock.unlocked() {
-                // Process refund claims separately so an illiquid ordinary tranche cannot block them.
-                if tranche.available_epoch_height <= epoch && (!has_matured_refund || tranche.refund_near > 0) {
+                if tranche.available_epoch_height <= epoch {
                     amount = amount.checked_add(tranche.amount).expect("Withdrawal amount overflow");
                     residual = residual.checked_add(tranche.wnear_residual).expect("Residual overflow");
-                    refund_near = refund_near.checked_add(tranche.refund_near).expect("Refund NEAR overflow");
                     latest_epoch = latest_epoch.max(tranche.available_epoch_height);
                     return false;
                 }
@@ -747,7 +904,6 @@ impl Contract {
         });
         require!(amount > 0, "Withdrawal request has not matured");
         require!(residual <= amount, "Withdrawal residual exceeds claim");
-        require!(refund_near <= amount - residual, "Refund NEAR exceeds unwrapped claim");
         let WithdrawTokens::Wnear { min_gas, .. } = &request.message.withdraw_tokens;
         // Wrap path: 10 Tgas near_deposit + 135 Tgas on_near_deposit + 15 Tgas for this call.
         // Residual path: (receiver gas + 30) for ft_transfer_call + 25 for its callback + 10 for this call.
@@ -765,17 +921,13 @@ impl Contract {
             amount,
             available_epoch_height: latest_epoch,
             wnear_residual: residual,
-            refund_near,
         };
         let amount_to_wrap = amount - residual;
-        // This request may spend its own escrow, but not escrow belonging to other requests.
-        let available = self.available_near().checked_add(refund_near).expect("Available NEAR overflow");
-        require!(available >= amount_to_wrap, ERR_NO_ENOUGH_CONTRACT_BALANCE);
+        require!(self.available_near() >= amount_to_wrap, ERR_NO_ENOUGH_CONTRACT_BALANCE);
         let promise = if amount_to_wrap > 0 {
             request.tranches.push(TrancheLock::Wrapping { tranche, amount_to_wrap });
             self.save_request(&key, Some(request));
-            let available = self.available_near().checked_add(refund_near).expect("Available NEAR overflow");
-            require!(available >= amount_to_wrap, ERR_NO_ENOUGH_CONTRACT_BALANCE);
+            require!(self.available_near() >= amount_to_wrap, ERR_NO_ENOUGH_CONTRACT_BALANCE);
             ext_wnear::ext(wnear_id)
                 .with_attached_deposit(NearToken::from_yoctonear(amount_to_wrap))
                 .with_static_gas(GAS_WNEAR_WRAP)
@@ -820,7 +972,8 @@ impl Contract {
             _ => env::panic_str("Wrapping recovery stage mismatch"),
         };
         if wrapped {
-            self.mark_refund_wrapped(&mut tranche, amount_to_wrap);
+            tranche.wnear_residual = tranche.wnear_residual.checked_add(amount_to_wrap).expect("Wrapped residual overflow");
+            require!(tranche.wnear_residual <= tranche.amount, "Wrapped residual exceeds claim");
         }
         request.tranches[index] = TrancheLock::Unlocked(tranche);
         self.save_request(&key, Some(request));
@@ -884,7 +1037,7 @@ impl Contract {
             .emit();
             return PromiseOrValue::Value(());
         }
-        self.mark_refund_wrapped(&mut tranche, amount_to_wrap);
+        tranche.wnear_residual = tranche.wnear_residual.checked_add(amount_to_wrap).expect("Wrapped residual overflow");
         require!(tranche.wnear_residual == tranche.amount, "Wrapped amount differs from claim");
         let amount_to_send = tranche.amount;
         request.tranches[index] = TrancheLock::WnearSending { tranche, amount_to_send };
@@ -925,15 +1078,74 @@ impl Contract {
     }
 
     #[private]
-    pub fn on_wnear_unwrapped(&mut self, platform_id: AccountId, amount: U128, message: StakeMessage, reserved_bytes: u64) -> PromiseOrValue<U128> {
+    pub fn on_stake_recovery_wrapped(&mut self, attempt_id: u64) -> PromiseOrValue<()> {
+        let mut entry = self.data().stake_lostfound.get(&attempt_id).cloned().expect("Stake attempt does not exist");
+        require!(entry.status == StakeLostFoundStatus::Wrapping, "Stake recovery is not wrapping");
         if matches!(env::promise_result(0), PromiseResult::Failed) {
-            self.release_platform_storage(&platform_id, reserved_bytes);
-            Event::StakeUnwrapFailed {
-                platform_id: &platform_id,
-                amount,
+            entry.status = StakeLostFoundStatus::Near;
+            self.save_stake_lostfound(attempt_id, Some(entry.clone()), &entry.platform_id);
+            Event::StakeRecoveryFailed {
+                attempt_id,
+                platform_id: &entry.platform_id,
+                stage: "wrapping",
             }
             .emit();
-            return PromiseOrValue::Value(amount);
+            return PromiseOrValue::Value(());
+        }
+        self.data_mut().stake_lostfound_near_reserved = self
+            .data()
+            .stake_lostfound_near_reserved
+            .checked_sub(entry.amount)
+            .expect("Lost-found NEAR reserve underflow");
+        entry.status = StakeLostFoundStatus::Sending;
+        self.save_stake_lostfound(attempt_id, Some(entry.clone()), &entry.platform_id);
+        PromiseOrValue::Promise(self.send_stake_recovery_wnear(attempt_id, &entry))
+    }
+
+    #[private]
+    pub fn on_stake_recovery_transfer(&mut self, attempt_id: u64) {
+        let entry = self.data().stake_lostfound.get(&attempt_id).cloned().expect("Stake attempt does not exist");
+        require!(entry.status == StakeLostFoundStatus::Sending, "Stake recovery is not sending");
+        if let PromiseResult::Successful(bytes) = env::promise_result(0) {
+            if let Ok(consumed) = serde_json::from_slice::<U128>(&bytes) {
+                if consumed.0 <= entry.amount {
+                    self.settle_stake_recovery_transfer(attempt_id, consumed.0);
+                    return;
+                }
+            }
+        }
+        Event::StakeRecoveryFailed {
+            attempt_id,
+            platform_id: &entry.platform_id,
+            stage: "sending_unclear",
+        }
+        .emit();
+    }
+
+    #[private]
+    pub fn on_wnear_unwrapped(&mut self, attempt_id: u64, message: StakeMessage) {
+        let mut entry = self.data().stake_lostfound.get(&attempt_id).cloned().expect("Stake attempt does not exist");
+        require!(entry.status == StakeLostFoundStatus::Processing, "Stake attempt is not processing");
+        require!(entry.refund_message == message.refund_message, "Stake refund route mismatch");
+        let platform_id = entry.platform_id.clone();
+        let amount = U128(entry.amount);
+        let reserved_bytes = entry.reserved_bytes;
+        if matches!(env::promise_result(0), PromiseResult::Failed) {
+            entry.status = StakeLostFoundStatus::Wnear;
+            self.save_stake_lostfound(attempt_id, Some(entry), &platform_id);
+            self.data_mut().stake_lostfound_near_reserved = self
+                .data()
+                .stake_lostfound_near_reserved
+                .checked_sub(amount.0)
+                .expect("Lost-found NEAR reserve underflow");
+            Event::StakeLostFoundDetected {
+                attempt_id,
+                platform_id: &platform_id,
+                amount,
+                status: StakeLostFoundStatus::Wnear,
+            }
+            .emit();
+            return;
         }
         #[cfg(feature = "test")]
         if message.memo.as_deref() == Some("__panic_after_unwrap__") {
@@ -951,18 +1163,16 @@ impl Contract {
             || self.data().total_staked_near_amount.checked_add(amount.0).is_none()
             || self.data().epoch_requested_stake_amount.checked_add(amount.0).is_none()
         {
-            return ext_wnear::ext(self.configured_wnear_id())
-                .with_attached_deposit(NearToken::from_yoctonear(amount.0))
-                .with_static_gas(GAS_WNEAR_DEPOSIT)
-                .with_unused_gas_weight(0)
-                .near_deposit()
-                .then(
-                    Self::ext(env::current_account_id())
-                        .with_static_gas(GAS_ON_REWRAPPED)
-                        .with_unused_gas_weight(0)
-                        .on_rewrapped_for_refund(platform_id, amount, message.refund_message, reserved_bytes),
-                )
-                .into();
+            entry.status = StakeLostFoundStatus::Near;
+            self.save_stake_lostfound(attempt_id, Some(entry), &platform_id);
+            Event::StakeLostFoundDetected {
+                attempt_id,
+                platform_id: &platform_id,
+                amount,
+                status: StakeLostFoundStatus::Near,
+            }
+            .emit();
+            return;
         }
         let contract_id = env::current_account_id();
         self.mint_lst(&contract_id, shares, Some("stake"));
@@ -971,7 +1181,9 @@ impl Contract {
         self.data_mut()
             .token
             .internal_transfer(&contract_id, &message.receiver_id, shares, message.memo.clone());
+        self.remove_stake_lostfound(attempt_id, &entry);
         Event::StakeCompleted {
+            attempt_id,
             platform_id: &platform_id,
             receiver_id: &message.receiver_id,
             stake_amount: amount,
@@ -989,34 +1201,6 @@ impl Contract {
                     .with_unused_gas_weight(0)
                     .on_stake_delivery_resolved(platform_id, message.receiver_id, shares.into(), message.refund_message, reserved_bytes),
             );
-        PromiseOrValue::Value(U128(0))
-    }
-
-    #[private]
-    pub fn on_rewrapped_for_refund(&mut self, platform_id: AccountId, amount: U128, refund_message: UnstakeMessage, reserved_bytes: u64) -> U128 {
-        if matches!(env::promise_result(0), PromiseResult::Successful(_)) {
-            self.release_platform_storage(&platform_id, reserved_bytes);
-            Event::StakeRewrappedForRefund {
-                platform_id: &platform_id,
-                amount,
-            }
-            .emit();
-            amount
-        } else {
-            let request_key = self.enqueue_rewrap_refund(&platform_id, amount.0, refund_message, reserved_bytes);
-            Event::StakeRewrapFailed {
-                platform_id: &platform_id,
-                amount,
-            }
-            .emit();
-            Event::StakeRefundQueued {
-                platform_id: &platform_id,
-                request_key: request_key.into(),
-                amount,
-            }
-            .emit();
-            U128(0)
-        }
     }
 
     #[private]
@@ -1054,6 +1238,31 @@ impl Contract {
 
 #[near]
 impl Contract {
+    pub fn get_stake_lostfound(&self, attempt_id: u64) -> Option<StakeLostFoundView> {
+        self.data().stake_lostfound.get(&attempt_id).map(|entry| StakeLostFoundView {
+            attempt_id,
+            platform_id: entry.platform_id.clone(),
+            amount: U128(entry.amount),
+            refund_message: entry.refund_message.clone(),
+            created_block_height: entry.created_block_height,
+            status: entry.status,
+        })
+    }
+
+    pub fn get_stake_lostfound_entries(&self, from_index: Option<usize>, limit: Option<usize>) -> Vec<StakeLostFoundView> {
+        self.data()
+            .stake_lostfound
+            .keys()
+            .skip(from_index.unwrap_or(0))
+            .take(limit.unwrap_or(50).min(100))
+            .filter_map(|attempt_id| self.get_stake_lostfound(*attempt_id))
+            .collect()
+    }
+
+    pub fn get_stake_lostfound_near_reserved(&self) -> U128 {
+        U128(self.data().stake_lostfound_near_reserved)
+    }
+
     pub fn get_emergency_storage_reserve(&self) -> U128 {
         U128(self.data().emergency_storage_reserve)
     }
@@ -1276,7 +1485,6 @@ impl Contract {
                             amount: tranche.amount.into(),
                             available_epoch_height: tranche.available_epoch_height,
                             wnear_residual: tranche.wnear_residual.into(),
-                            refund_near: tranche.refund_near.into(),
                             matured: tranche.available_epoch_height <= get_epoch_height(),
                             locked: lock.is_locked(),
                         }
@@ -1304,10 +1512,6 @@ impl Contract {
 
     pub fn get_total_pending_withdrawal_amount(&self) -> U128 {
         self.data().total_pending_withdrawal_amount.into()
-    }
-
-    pub fn get_refund_near_reserved(&self) -> U128 {
-        self.data().refund_near_reserved.into()
     }
 
     pub fn get_withdrawal_requests(&self, platform_id: AccountId, from_index: Option<usize>, limit: Option<usize>) -> Vec<WithdrawalRequestView> {

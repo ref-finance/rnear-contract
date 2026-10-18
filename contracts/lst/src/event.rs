@@ -1,3 +1,4 @@
+use crate::{StakeLostFoundStatus, StakeRecoveryAsset};
 use near_sdk::{
     json_types::{Base58CryptoHash, U128},
     log,
@@ -215,6 +216,7 @@ pub enum Event<'a> {
         remaining_amount: U128,
     },
     StakeAccepted {
+        attempt_id: u64,
         platform_id: &'a AccountId,
         receiver_id: &'a AccountId,
         deposit_amount: U128,
@@ -242,28 +244,45 @@ pub enum Event<'a> {
         #[serde(skip_serializing_if = "Option::is_none")]
         result: Option<&'a str>,
     },
-    StakeUnwrapFailed {
+    StakeLostFoundDetected {
+        attempt_id: u64,
         platform_id: &'a AccountId,
         amount: U128,
+        status: StakeLostFoundStatus,
+    },
+    StakeRecoveryAttempt {
+        attempt_id: u64,
+        platform_id: &'a AccountId,
+        amount: U128,
+        asset: StakeRecoveryAsset,
+        evidence: Base58CryptoHash,
+    },
+    StakeRecoveryFailed {
+        attempt_id: u64,
+        platform_id: &'a AccountId,
+        stage: &'a str,
+    },
+    StakeRecoveryDelivered {
+        attempt_id: u64,
+        platform_id: &'a AccountId,
+        consumed: U128,
+        remaining: U128,
+    },
+    StakeRecoveryReconciled {
+        attempt_id: u64,
+        platform_id: &'a AccountId,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        asset: Option<StakeRecoveryAsset>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        consumed: Option<U128>,
+        evidence: Base58CryptoHash,
     },
     StakeCompleted {
+        attempt_id: u64,
         platform_id: &'a AccountId,
         receiver_id: &'a AccountId,
         stake_amount: U128,
         shares: U128,
-    },
-    StakeRewrappedForRefund {
-        platform_id: &'a AccountId,
-        amount: U128,
-    },
-    StakeRewrapFailed {
-        platform_id: &'a AccountId,
-        amount: U128,
-    },
-    StakeRefundQueued {
-        platform_id: &'a AccountId,
-        request_key: Base58CryptoHash,
-        amount: U128,
     },
     PlatformStakeDeliveryRefunded {
         platform_id: &'a AccountId,

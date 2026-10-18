@@ -1,6 +1,6 @@
 # rNEAR
 
-## Platform integration (Plan A)
+## Platform integration
 
 The LST accepts wNEAR `ft_transfer_call` stakes from registered platform users,
 delivers rNEAR shares, and stores platform-scoped unstake requests. Matured
@@ -21,14 +21,29 @@ rejected before wNEAR is unwrapped. Unstake and refund routes currently support
 only `WithdrawTokens.Wnear` with a non-empty `msg`; withdrawal delivery always
 uses wNEAR `ft_transfer_call`. `WithdrawTokens.Native` is not supported.
 
-Plan A follows the returning Promise chain and has no per-stake recovery record.
-Sandbox fault injection confirms that a post-unwrap callback panic or out-of-gas
-failure can leave a storage reservation pending and cause the outer wNEAR
-resolver to refund from wNEAR already held by this contract. A failed re-wrap
-does not use shared wNEAR for a refund: it queues an immediately withdrawable
-NEAR-backed claim under the supplied refund route. This still depends on its
-callback completing; callback panic or out-of-gas remains a known Plan A risk,
-not covered by its normal failure handling. Do not deploy this integration
-without an independent security review and an explicit decision to accept these
-failure assumptions; use a pending-stake recovery design (Plan B) if they are
-unacceptable.
+Accepted wNEAR stakes create a per-attempt lost-found record before the unwrap
+Promise is scheduled and return `0` to the outer wNEAR resolver. This prevents
+an unwrap callback failure from refunding out of the contract's shared wNEAR.
+The outer `ft_transfer_call` succeeding means only that the stake was accepted;
+integrators must wait for `stake_completed` or inspect the attempt record.
+The record is removed atomically with successful rNEAR minting; an unsuccessful
+or missing callback leaves it in `Wnear`, `Near`, or `Processing` status. No
+failed stake is retried or automatically refunded. `get_stake_lostfound` and
+`get_stake_lostfound_entries` expose pending records, and
+`get_stake_lostfound_near_reserved` reports possible NEAR liabilities excluded
+from ordinary spendable balance.
+
+After checking the transaction's final receipts and verifying that the contract
+still holds the indicated asset, the owner calls `recover_stake_lostfound` with
+the attempt ID, asset (`Near` or `Wnear`), and evidence hash. The call directly
+wraps NEAR if needed and sends wNEAR to the immutable refund route; no
+`withdraw_request` or special withdrawal tranche is created. A known `Near` or
+`Wnear` status cannot be recovered as the opposite asset; `Processing` requires
+operator judgment. A failed wrap remains retryable, and an unused transfer
+amount remains in the attempt record. If a recovery callback cannot establish
+the outcome, the record stays locked in `Wrapping` or `Sending` until the owner
+checks the receipts and calls `reconcile_stake_wrapping` or
+`reconcile_stake_transfer` with evidence. Operator verification is essential:
+the contract cannot prove from a failed callback alone which asset it holds or
+whether a transfer was consumed. This integration still requires an independent
+security review before deployment.

@@ -67,6 +67,7 @@ enum StorageKey {
     Validators,
     PlatformUsers,
     WithdrawalRequests,
+    StakeLostFound,
 }
 
 #[near(serializers = [borsh])]
@@ -107,11 +108,13 @@ pub struct ContractData {
     platform_users: IterableMap<AccountId, PlatformUser>,
     withdrawal_requests: IterableMap<PlatformRequestKey, WithdrawalRequest>,
     total_pending_withdrawal_amount: u128,
-    refund_near_reserved: u128,
     total_platform_user_storage_deposits: u128,
     emergency_storage_reserve: u128,
     total_active_request_keys: u32,
     total_inflight_storage_operations: u32,
+    stake_lostfound: IterableMap<u64, StakeLostFound>,
+    next_stake_attempt_id: u64,
+    stake_lostfound_near_reserved: u128,
 }
 
 #[near(serializers = [borsh])]
@@ -182,11 +185,13 @@ impl Contract {
                 platform_users: IterableMap::new(StorageKey::PlatformUsers),
                 withdrawal_requests: IterableMap::new(StorageKey::WithdrawalRequests),
                 total_pending_withdrawal_amount: 0,
-                refund_near_reserved: 0,
                 total_platform_user_storage_deposits: 0,
                 emergency_storage_reserve: 0,
                 total_active_request_keys: 0,
                 total_inflight_storage_operations: 0,
+                stake_lostfound: IterableMap::new(StorageKey::StakeLostFound),
+                next_stake_attempt_id: 0,
+                stake_lostfound_near_reserved: 0,
             }),
         };
 
@@ -229,12 +234,13 @@ impl Contract {
             .checked_add(CONTRACT_MIN_RESERVE_BALANCE.as_yoctonear())
             .and_then(|value| value.checked_add(self.data().total_platform_user_storage_deposits))
             .and_then(|value| value.checked_add(self.data().emergency_storage_reserve))
-            .and_then(|value| value.checked_add(self.data().refund_near_reserved))
             .expect("NEAR reserve overflow");
-        env::account_balance()
+        let available = env::account_balance()
             .as_yoctonear()
             .checked_sub(reserved)
-            .expect("NEAR balance is below reserved funds")
+            .expect("NEAR balance is below reserved funds");
+        // An in-flight unwrap may not have credited NEAR yet; reserve its possible proceeds without panicking.
+        available.saturating_sub(self.data().stake_lostfound_near_reserved)
     }
 
     fn measure_storage_usage(&mut self) {
