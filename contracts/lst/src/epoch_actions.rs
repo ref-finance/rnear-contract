@@ -418,21 +418,24 @@ impl Contract {
 
         match result {
             Ok(account) => {
-                // allow at most max_sync_balance_diff diff in total balance, staked balance and unstake balance
+                let old_total_balance = validator.total_balance();
                 let new_total_balance = account.staked_balance.0 + account.unstaked_balance.0;
-                if abs_diff_eq(
-                    new_total_balance,
-                    validator.total_balance(),
-                    MAX_SYNC_BALANCE_DIFF,
-                ) && abs_diff_eq(
-                    account.staked_balance.0,
-                    validator.staked_amount,
-                    MAX_SYNC_BALANCE_DIFF,
-                ) && abs_diff_eq(
-                    account.unstaked_balance.0,
-                    validator.unstaked_amount,
-                    MAX_SYNC_BALANCE_DIFF,
-                ) {
+                let rewards = new_total_balance.saturating_sub(old_total_balance);
+                let total_valid = new_total_balance >= old_total_balance
+                    || old_total_balance - new_total_balance <= MAX_SYNC_BALANCE_DIFF;
+                let balances_valid = if validator.draining {
+                    account.staked_balance.0 == 0
+                } else {
+                    abs_diff_eq(
+                        account.unstaked_balance.0,
+                        validator.unstaked_amount,
+                        MAX_SYNC_BALANCE_DIFF,
+                    ) && validator.staked_amount.checked_add(rewards).is_some_and(|expected| {
+                        abs_diff_eq(account.staked_balance.0, expected, MAX_SYNC_BALANCE_DIFF)
+                    })
+                };
+
+                if total_valid && balances_valid {
                     Event::SyncValidatorBalanceSuccess {
                         validator_id: &validator_id,
                         old_staked_balance: &validator.staked_amount.into(),
@@ -448,6 +451,18 @@ impl Contract {
                         account.staked_balance.0,
                         account.unstaked_balance.0,
                     );
+                    if rewards > 0 {
+                        Event::EpochUpdateRewards {
+                            validator_id: &validator_id,
+                            old_balance: &U128(old_total_balance),
+                            new_balance: &U128(new_total_balance),
+                            rewards: &U128(rewards),
+                        }
+                        .emit();
+                        self.data_mut().total_staked_near_amount += rewards;
+                        self.internal_distribute_staking_rewards(rewards);
+                    }
+                    true
                 } else {
                     Event::SyncValidatorBalanceFailedLargeDiff {
                         validator_id: &validator_id,
@@ -460,6 +475,7 @@ impl Contract {
                     }
                     .emit();
                     validator.on_sync_account_balance_failed(&mut self.data_mut().validator_pool);
+                    false
                 }
             }
             Err(_) => {
@@ -471,9 +487,9 @@ impl Contract {
                 }
                 .emit();
                 validator.on_sync_account_balance_failed(&mut self.data_mut().validator_pool);
+                false
             }
-        };
-        true
+        }
     }
 
     #[private]

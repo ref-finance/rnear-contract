@@ -5,6 +5,10 @@ const ERR_PERM: &str = "Smart contract panicked: Insufficient permissions for me
 
 // cargo nextest run --package lst --test test_drain --no-capture
 
+async fn summary(context: &Context) -> lst::Summary {
+    context.lst_contract.0.call("get_summary").view().await.unwrap().json().unwrap()
+}
+
 #[tokio::test]
 async fn test_drain_not_manager() {
     let worker = near_workspaces::sandbox().await.unwrap();
@@ -156,4 +160,116 @@ async fn test_drain_get_account_fail() {
 
     check!(v1.set_get_account_fail(&context.root, true));
     check!(logs context.lst_contract.drain_unstake(&context.root, v1.0.id()), "get_account() failed, for testing purpose");
+}
+
+#[tokio::test]
+async fn test_drain_unstake_settles_rewards() {
+    let worker = near_workspaces::sandbox().await.unwrap();
+    let context = Context::new(&worker, None).await;
+    check!(context.mock_whitelist.allow_all(&context.root));
+
+    let validator = context.create_validator("v1").await;
+    check!(context.lst_contract.add_validator(&context.root, validator.0.id(), 10));
+    context.op_epoch_stake_all().await;
+    check!(context.lst_contract.update_weight(&context.root, validator.0.id(), 0));
+
+    for index in 0..10 {
+        let beneficiary: AccountId = format!("fee{index}.near").parse().unwrap();
+        check!(context.lst_contract.set_beneficiary(&context.root, &beneficiary, 100));
+    }
+
+    let reward = 2 * lst::ONE_NEAR;
+    let before = summary(&context).await;
+    check!(validator.set_pending_reward(&context.root, reward));
+    check!(context.lst_contract.drain_unstake(&context.root, validator.0.id()));
+
+    context.check_validator_amount(&validator, 0, 12 * lst::ONE_NEAR, None, None).await;
+    let after = summary(&context).await;
+    assert_eq!(after.total_staked_near_amount.0, before.total_staked_near_amount.0 + reward);
+    assert!(after.total_share_amount.0 > before.total_share_amount.0);
+    assert_eq!(after.epoch_requested_stake_amount.0, before.epoch_requested_stake_amount.0);
+
+    check!(context.lst_contract.epoch_update_rewards(&context.root, validator.0.id()));
+    let repeated = summary(&context).await;
+    assert_eq!(repeated.total_staked_near_amount.0, after.total_staked_near_amount.0);
+    assert_eq!(repeated.total_share_amount.0, after.total_share_amount.0);
+
+    check!(context.lst_contract.set_epoch_height(&context.root, 14));
+    check!(context.lst_contract.drain_withdraw(&context.root, validator.0.id()));
+    context.check_validator_amount(&validator, 0, 0, None, None).await;
+    let withdrawn = summary(&context).await;
+    assert_eq!(withdrawn.epoch_requested_stake_amount.0, after.epoch_requested_stake_amount.0 + 12 * lst::ONE_NEAR);
+}
+
+#[tokio::test]
+async fn test_drain_retry_recovers_staked_residue() {
+    let worker = near_workspaces::sandbox().await.unwrap();
+    let context = Context::new(&worker, None).await;
+    check!(context.mock_whitelist.allow_all(&context.root));
+
+    let validator = context.create_validator("v1").await;
+    check!(context.lst_contract.add_validator(&context.root, validator.0.id(), 10));
+    context.op_epoch_stake_all().await;
+    check!(context.lst_contract.update_weight(&context.root, validator.0.id(), 0));
+    check!(context.lst_contract.drain_unstake(&context.root, validator.0.id()));
+
+    let residue = 2 * lst::ONE_NEAR;
+    check!(validator.add_reward(context.lst_contract.0.as_account(), residue));
+    let premature_sync = context.lst_contract.sync_balance_from_validator(&context.root, validator.0.id()).await.unwrap();
+    assert!(premature_sync.logs().iter().any(|log| log.contains("sync_validator_balance_failed_large_diff")));
+    check!(context.lst_contract.epoch_update_rewards(&context.root, validator.0.id()));
+    context.check_validator_amount(&validator, residue, 10 * lst::ONE_NEAR, None, None).await;
+
+    check!(context.lst_contract.set_epoch_height(&context.root, 14));
+    check!(context.lst_contract.drain_withdraw(&context.root, validator.0.id()), lst::ERR_NON_ZERO_STAKED_AMOUNT);
+    check!(validator.set_panic(&context.root, true));
+    check!(logs context.lst_contract.drain_unstake(&context.root, validator.0.id()), "Test Panic!");
+    let after_failure = context.lst_contract.get_validator(validator.0.id()).await.unwrap().unwrap();
+    assert!(after_failure.draining);
+    assert!(!after_failure.pending_release);
+    check!(validator.set_panic(&context.root, false));
+    context.check_validator_amount(&validator, residue, 10 * lst::ONE_NEAR, None, None).await;
+
+    check!(validator.set_pending_reward(&context.root, lst::ONE_NEAR));
+    let before_retry = summary(&context).await;
+    check!(context.lst_contract.drain_unstake(&context.root, validator.0.id()));
+    context.check_validator_amount(&validator, 0, 13 * lst::ONE_NEAR, None, None).await;
+    let after_retry = summary(&context).await;
+    assert_eq!(after_retry.total_staked_near_amount.0, before_retry.total_staked_near_amount.0 + lst::ONE_NEAR);
+    assert_eq!(after_retry.epoch_requested_stake_amount.0, before_retry.epoch_requested_stake_amount.0);
+
+    check!(context.lst_contract.set_epoch_height(&context.root, 18));
+    check!(context.lst_contract.drain_withdraw(&context.root, validator.0.id()));
+    context.check_validator_amount(&validator, 0, 0, None, None).await;
+    let withdrawn = summary(&context).await;
+    assert_eq!(withdrawn.epoch_requested_stake_amount.0, before_retry.epoch_requested_stake_amount.0 + 13 * lst::ONE_NEAR);
+}
+
+#[tokio::test]
+async fn test_drain_sync_recovers_after_query_failure() {
+    let worker = near_workspaces::sandbox().await.unwrap();
+    let context = Context::new(&worker, None).await;
+    check!(context.mock_whitelist.allow_all(&context.root));
+
+    let validator = context.create_validator("v1").await;
+    check!(context.lst_contract.add_validator(&context.root, validator.0.id(), 10));
+    context.op_epoch_stake_all().await;
+    check!(context.lst_contract.update_weight(&context.root, validator.0.id(), 0));
+
+    check!(validator.set_pending_reward(&context.root, 2 * lst::ONE_NEAR));
+    check!(validator.set_get_account_fail(&context.root, true));
+    check!(logs context.lst_contract.drain_unstake(&context.root, validator.0.id()), "get_account() failed, for testing purpose");
+
+    let before_sync = context.lst_contract.get_validator(validator.0.id()).await.unwrap().unwrap();
+    assert!(before_sync.draining);
+    assert_eq!(before_sync.unstaked_amount.0, 10 * lst::ONE_NEAR);
+    assert_eq!(validator.get_account_unstaked_balance(context.lst_contract.0.id()).await.unwrap().0, 12 * lst::ONE_NEAR);
+
+    check!(validator.set_get_account_fail(&context.root, false));
+    check!(context.lst_contract.sync_balance_from_validator(&context.root, validator.0.id()));
+    context.check_validator_amount(&validator, 0, 12 * lst::ONE_NEAR, None, None).await;
+    assert_eq!(summary(&context).await.total_staked_near_amount.0, 12 * lst::ONE_NEAR);
+
+    check!(context.lst_contract.set_epoch_height(&context.root, 14));
+    check!(context.lst_contract.drain_withdraw(&context.root, validator.0.id()));
 }

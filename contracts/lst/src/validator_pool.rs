@@ -531,8 +531,7 @@ impl Contract {
         // 1. has weight set to 0
         // 2. has base stake amount set to 0
         // 3. not in pending release
-        // 4. has not unstaked balance (because this part is from user's unstake request)
-        // 5. not in draining process
+        // 4. on first drain, has no unstaked balance from user requests
         require!(validator.weight == 0, ERR_NON_ZERO_WEIGHT);
         require!(
             validator.base_stake_amount == 0,
@@ -542,14 +541,13 @@ impl Contract {
             !validator.pending_release(),
             ERR_VALIDATOR_UNSTAKE_WHEN_LOCKED
         );
-        // in practice we allow 1 NEAR due to the precision of stake operation
-        require!(
-            validator.unstaked_amount < ONE_NEAR,
-            ERR_BAD_UNSTAKED_AMOUNT
-        );
-        require!(!validator.draining, ERR_DRAINING);
+        if !validator.draining {
+            // Allow 1 NEAR on the first drain due to staking precision.
+            require!(validator.unstaked_amount < ONE_NEAR, ERR_BAD_UNSTAKED_AMOUNT);
+        }
 
         let unstake_amount = validator.staked_amount;
+        require!(unstake_amount > 0, ERR_NON_POSITIVE_UNSTAKING_AMOUNT);
 
         Event::DrainUnstakeAttempt {
             validator_id: &validator_id,
@@ -559,7 +557,7 @@ impl Contract {
 
         // perform actual unstake
         validator
-            .unstake(&mut self.data_mut().validator_pool, unstake_amount)
+            .unstake_all(&mut self.data_mut().validator_pool)
             .then(
                 Self::ext(env::current_account_id())
                     .with_static_gas(

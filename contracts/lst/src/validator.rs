@@ -129,9 +129,6 @@ impl Validator {
     }
 
     pub fn unstake(&mut self, pool: &mut ValidatorPool, amount: u128) -> Promise {
-        // avoid unstake from a validator which is pending release
-        require!(!self.pending_release(), ERR_VALIDATOR_UNSTAKE_WHEN_LOCKED);
-
         require!(
             amount <= self.staked_amount,
             format!(
@@ -140,16 +137,30 @@ impl Validator {
             )
         );
 
+        self.begin_unstake(pool);
+
+        ext_staking_pool::ext(self.account_id.clone())
+            .with_static_gas(GAS_EXT_UNSTAKE)
+            .unstake(amount.into())
+    }
+
+    pub fn unstake_all(&mut self, pool: &mut ValidatorPool) -> Promise {
+        require!(self.staked_amount > 0, ERR_NON_POSITIVE_UNSTAKING_AMOUNT);
+        self.begin_unstake(pool);
+
+        ext_staking_pool::ext(self.account_id.clone())
+            .with_static_gas(GAS_EXT_UNSTAKE)
+            .unstake_all()
+    }
+
+    fn begin_unstake(&mut self, pool: &mut ValidatorPool) {
+        require!(!self.pending_release(), ERR_VALIDATOR_UNSTAKE_WHEN_LOCKED);
         self.pre_execution(pool);
 
         self.last_unstake_fired_epoch = self.unstake_fired_epoch;
         self.unstake_fired_epoch = get_epoch_height();
 
         pool.save_validator(self);
-
-        ext_staking_pool::ext(self.account_id.clone())
-            .with_static_gas(GAS_EXT_UNSTAKE)
-            .unstake(amount.into())
     }
 
     pub fn on_unstake_success(&mut self, pool: &mut ValidatorPool, amount: u128) {

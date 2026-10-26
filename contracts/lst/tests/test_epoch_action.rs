@@ -2,6 +2,65 @@ mod setup;
 use setup::*;
 
 #[tokio::test]
+async fn test_epoch_actions_account_for_rewards_settled_during_pool_calls() {
+    let worker = near_workspaces::sandbox().await.unwrap();
+    let context = Context::new(&worker, None).await;
+    check!(context.mock_whitelist.allow_all(&context.root));
+
+    let validator = context.create_validator("v1").await;
+    check!(context.lst_contract.add_validator(&context.root, validator.0.id(), 10));
+    check!(context.lst_contract.storage_deposit(&context.alice, None, FT_STORAGE_DEPOSIT));
+    check!(context.lst_contract.deposit_and_stake(&context.alice, 20));
+    context.op_epoch_stake_all().await;
+    check!(context.lst_contract.set_beneficiary(&context.root, context.manager.id(), 1000));
+
+    check!(context.lst_contract.set_epoch_height(&context.root, 11));
+    check!(context.lst_contract.deposit_and_stake(&context.alice, 10));
+    check!(validator.set_pending_reward(&context.root, 2 * lst::ONE_NEAR));
+    context.op_epoch_stake_all().await;
+    context.check_validator_amount(&validator, 42 * lst::ONE_NEAR, 0, None, None).await;
+    assert_eq!(context.lst_contract.get_total_staked_balance().await.unwrap().0, 42 * lst::ONE_NEAR);
+    let fees_after_stake = context.lst_contract.ft_balance_of(context.manager.id()).await.unwrap().0;
+    assert!(fees_after_stake > 0);
+
+    check!(context.lst_contract.set_epoch_height(&context.root, 14));
+    check!(context.lst_contract.unstake(&context.alice, 5));
+    check!(validator.set_pending_reward(&context.root, lst::ONE_NEAR));
+    context.op_epoch_unstake_all().await;
+    context.check_validator_amount(&validator, 38 * lst::ONE_NEAR, 5 * lst::ONE_NEAR, None, None).await;
+    assert_eq!(context.lst_contract.get_total_staked_balance().await.unwrap().0, 38 * lst::ONE_NEAR);
+    let fees_after_unstake = context.lst_contract.ft_balance_of(context.manager.id()).await.unwrap().0;
+    assert!(fees_after_unstake > fees_after_stake);
+
+    check!(context.lst_contract.epoch_update_rewards(&context.root, validator.0.id()));
+    assert_eq!(context.lst_contract.get_total_staked_balance().await.unwrap().0, 38 * lst::ONE_NEAR);
+    assert_eq!(context.lst_contract.ft_balance_of(context.manager.id()).await.unwrap().0, fees_after_unstake);
+}
+
+#[tokio::test]
+async fn test_sync_rejects_total_balance_loss_above_tolerance() {
+    let worker = near_workspaces::sandbox().await.unwrap();
+    let context = Context::new(&worker, None).await;
+    check!(context.mock_whitelist.allow_all(&context.root));
+
+    let validator = context.create_validator("v1").await;
+    check!(context.lst_contract.add_validator(&context.root, validator.0.id(), 10));
+    context.op_epoch_stake_all().await;
+
+    check!(context.lst_contract.set_epoch_height(&context.root, 11));
+    check!(context.lst_contract.storage_deposit(&context.alice, None, FT_STORAGE_DEPOSIT));
+    check!(context.lst_contract.deposit_and_stake(&context.alice, 10));
+    check!(validator.set_balance_delta(&context.root, 101, 0));
+
+    let outcome = context.lst_contract.epoch_stake(&context.root).await.unwrap();
+    assert!(outcome.logs().iter().any(|log| log.contains("sync_validator_balance_failed_large_diff")));
+    let info = context.lst_contract.get_validator(validator.0.id()).await.unwrap().unwrap();
+    assert_eq!(info.staked_amount.0, 20 * lst::ONE_NEAR);
+    assert_eq!(validator.get_account_staked_balance(context.lst_contract.0.id()).await.unwrap().0, 20 * lst::ONE_NEAR - 101);
+    assert_eq!(context.lst_contract.get_total_staked_balance().await.unwrap().0, 20 * lst::ONE_NEAR);
+}
+
+#[tokio::test]
 async fn test_epoch_stake() {
     let worker = near_workspaces::sandbox().await.unwrap();
     let context = Context::new(&worker, None).await;

@@ -629,6 +629,15 @@ impl LstContract {
             .await
     }
 
+    pub async fn sync_balance_from_validator(&self, caller: &Account, validator_id: &AccountId) -> Result<ExecutionFinalResult> {
+        caller
+            .call(self.0.id(), "sync_balance_from_validator")
+            .args_json(json!({ "validator_id": validator_id }))
+            .max_gas()
+            .transact()
+            .await
+    }
+
     pub async fn epoch_withdraw(&self, caller: &Account, validator_id: &AccountId) -> Result<ExecutionFinalResult> {
         caller
             .call(self.0.id(), "epoch_withdraw")
