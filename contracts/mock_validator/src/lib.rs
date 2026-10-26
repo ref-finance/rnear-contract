@@ -24,6 +24,7 @@ pub struct Contract {
 
     staked_delta: u128,
     unstaked_delta: u128,
+    pending_reward: u128,
 }
 
 #[near]
@@ -37,6 +38,7 @@ impl Contract {
             get_account_fail: false,
             staked_delta: 0,
             unstaked_delta: 0,
+            pending_reward: 0,
         }
     }
 }
@@ -83,6 +85,7 @@ impl Contract {
     #[payable]
     pub fn deposit_and_stake(&mut self) {
         require!(!self.panic, "Test Panic!");
+        self.apply_pending_reward();
         let amount = self.internal_deposit();
         self.internal_stake(amount);
     }
@@ -102,16 +105,19 @@ impl Contract {
 
     pub fn stake(&mut self, amount: U128) {
         require!(!self.panic, "Test Panic!");
+        self.apply_pending_reward();
         self.internal_stake(amount.0)
     }
 
     pub fn unstake(&mut self, amount: U128) {
         require!(!self.panic, "Test Panic!");
+        self.apply_pending_reward();
         self.internal_unstake(amount.0);
     }
 
     pub fn unstake_all(&mut self) {
         require!(!self.panic, "Test Panic!");
+        self.apply_pending_reward();
         let account_id = env::predecessor_account_id();
         let staked_amount = self.internal_get_staked(&account_id);
         self.internal_unstake(staked_amount);
@@ -149,9 +155,22 @@ impl Contract {
         self.staked_delta = staked_delta.0;
         self.unstaked_delta = unstaked_delta.0;
     }
+
+    pub fn set_pending_reward(&mut self, amount: U128) {
+        self.pending_reward = amount.0;
+    }
 }
 
 impl Contract {
+    fn apply_pending_reward(&mut self) {
+        let reward = std::mem::take(&mut self.pending_reward);
+        if reward > 0 {
+            let account_id = env::predecessor_account_id();
+            let staked = self.internal_get_staked(&account_id);
+            self.staked.insert(account_id, staked + reward);
+        }
+    }
+
     fn internal_deposit(&mut self) -> u128 {
         let account_id = env::predecessor_account_id();
         let amount = env::attached_deposit().as_yoctonear();

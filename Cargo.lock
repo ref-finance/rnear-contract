@@ -1531,7 +1531,7 @@ dependencies = [
 
 [[package]]
 name = "lst"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "near-contract-standards",
  "near-plugins",

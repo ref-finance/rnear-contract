@@ -63,4 +63,22 @@ impl MockValidatorContract {
             .transact()
             .await
     }
+
+    pub async fn set_pending_reward(&self, caller: &Account, amount: u128) -> Result<ExecutionFinalResult> {
+        caller
+            .call(self.0.id(), "set_pending_reward")
+            .args_json(json!({ "amount": amount.to_string() }))
+            .max_gas()
+            .transact()
+            .await
+    }
+
+    pub async fn set_panic(&self, caller: &Account, value: bool) -> Result<ExecutionFinalResult> {
+        caller
+            .call(self.0.id(), "set_panic")
+            .args_json(json!({ "panic": value }))
+            .max_gas()
+            .transact()
+            .await
+    }
 }

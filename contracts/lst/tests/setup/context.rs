@@ -12,6 +12,10 @@ pub struct Context {
 impl Context {
     pub async fn new(worker: &Worker<Sandbox>, wasm_path: Option<&str>) -> Self {
         let root = worker.root_account().unwrap();
+        let lst_wasm_path = wasm_path
+            .map(str::to_owned)
+            .or_else(|| std::env::var("LST_WASM_PATH").ok())
+            .unwrap_or_else(|| "../../res/lst.wasm".to_string());
         let (lst_contract, mock_whitelist) = tokio::join!(
             async {
                 let lst = root
@@ -21,7 +25,7 @@ impl Context {
                     .await
                     .unwrap()
                     .unwrap();
-                lst.deploy(&std::fs::read(wasm_path.unwrap_or("../../res/lst.wasm")).unwrap())
+                lst.deploy(&std::fs::read(&lst_wasm_path).unwrap())
                     .await
                     .unwrap()
                     .unwrap()
@@ -96,6 +100,8 @@ impl Context {
     }
 
     pub async fn create_validator(&self, validator_id: &str) -> MockValidatorContract {
+        let validator_wasm_path = std::env::var("MOCK_VALIDATOR_WASM_PATH")
+            .unwrap_or_else(|_| "../../res/mock_validator.wasm".to_string());
         let (v_contract,) = tokio::join!(async {
             let v = self
                 .root
@@ -105,7 +111,7 @@ impl Context {
                 .await
                 .unwrap()
                 .unwrap();
-            v.deploy(&std::fs::read("../../res/mock_validator.wasm").unwrap())
+            v.deploy(&std::fs::read(&validator_wasm_path).unwrap())
                 .await
                 .unwrap()
                 .unwrap()
